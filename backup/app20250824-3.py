@@ -1,9 +1,11 @@
 # app.py
-# pip install -U streamlit pandas plotly yfinance xlsxwriter requests beautifulsoup4 lxml
+# pip install -U streamlit pandas plotly yfinance xlsxwriter requests
 
-import os, re, math, time
+import os, re, math
 from io import BytesIO
 from datetime import date
+
+import time
 import html as ihtml
 
 import pandas as pd
@@ -17,7 +19,7 @@ st.set_page_config(page_title="Market Performance", layout="wide")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_CSV = os.path.join(BASE_DIR, "data", "market_timeseries.csv")
-META_CSV  = os.path.join(BASE_DIR, "data", "meta.csv")
+META_CSV = os.path.join(BASE_DIR, "data", "meta.csv")
 
 # -------------------- 인증(선택) --------------------
 def get_app_password():
@@ -58,7 +60,6 @@ COMMON_ALIASES = {
     "usdkrw": "KRW=X", "usdcny": "CNY=X",
 }
 
-# -------------------- Finviz 크롤러 --------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_finviz_company(ticker: str):
     """
@@ -86,16 +87,17 @@ def fetch_finviz_company(ticker: str):
 
         html = r.text
 
-        # 회사 소개
+        # 회사 소개 추출 (BeautifulSoup + yfinance 백업)
         from bs4 import BeautifulSoup
+
+        profile_text = None
         soup = BeautifulSoup(html, "html.parser")  # lxml 없어도 동작
         node = soup.select_one('td.fullview-profile') or soup.select_one('td[class*="fullview-profile"]')
-        profile_text = None
         if node:
             prof_raw = node.get_text(separator=" ", strip=True)
             profile_text = " ".join(ihtml.unescape(prof_raw).split())
 
-        # Finviz에 없으면 yfinance 백업
+        # Finviz에서 못 찾으면 yfinance로 백업
         if not profile_text:
             try:
                 info = (yf.Ticker(t).info or {})
@@ -104,10 +106,12 @@ def fetch_finviz_company(ticker: str):
                     profile_text = ysum.strip()
             except Exception:
                 pass
+
         if not profile_text:
             profile_text = "회사 소개를 찾을 수 없습니다 (Finviz)."
 
-        # 스냅샷 테이블
+
+        # 스냅샷 테이블 파싱
         tables = pd.read_html(html, attrs={"class": "snapshot-table2"})
         if not tables:
             df_wide = pd.DataFrame(
@@ -131,6 +135,7 @@ def fetch_finviz_company(ticker: str):
                 c2 = labels[i2] if i2 < n else ""
                 v2 = values[i2] if i2 < n else ""
                 data.append([c1, v1, c2, v2])
+
             df_wide = pd.DataFrame(data, columns=["Indicator 1","Value 1","Indicator 2","Value 2"])
 
         return profile_text, df_wide
@@ -140,7 +145,7 @@ def fetch_finviz_company(ticker: str):
             [{"Indicator 1":"Error","Value 1":str(e),"Indicator 2":"Ticker","Value 2":t}]
         )
 
-# -------------------- 야후 검색 --------------------
+
 def yahoo_search(query: str, quotes_count: int = 10):
     """야후 파이낸스 검색(비공식)"""
     q = query.strip()
@@ -255,7 +260,7 @@ def tab_market():
     if last_updated:
         st.caption(f"마지막 업데이트(KST): {last_updated} developed by W.I Lee")
 
-    # UI CSS
+    # UI CSS (입력 높이 + 표 가운데 정렬)
     st.markdown("""
     <style>
     :root { --ctrl-h: 42px; --pad-y: 8px; }
@@ -274,6 +279,7 @@ def tab_market():
       height: var(--ctrl-h) !important; padding-top: var(--pad-y) !important; padding-bottom: var(--pad-y) !important;
     }
     div[data-testid="stWidgetLabel"] > label { margin-bottom: 4px !important; }
+    /* 표 가운데 정렬 */
     [data-testid="stDataFrame"] table td, 
     [data-testid="stDataFrame"] table th { text-align: center !important; }
     </style>
@@ -315,14 +321,14 @@ def tab_market():
     def expand_aliases(seq):
         return [COMMON_ALIASES.get(t.lower(), t) for t in seq]
 
-    # 저장된 추가 티커
+    # 저장된 추가 티커 불러오기
     saved = tuple(st.session_state["m_extra"])
     if saved:
         fetched_saved = fetch_yf_prices(saved, start, end, use_adjust=use_adj)
         if not fetched_saved.empty:
             view = pd.merge(view, fetched_saved, on="Date", how="outer").sort_values("Date")
 
-    # 신규 추가
+    # 신규 추가 반영
     if fetch_clicked:
         parsed = [t.upper() for t in re.split(r"[,\s]+", st.session_state.get("m_tickers","")) if t.strip()]
         parsed = expand_aliases(parsed)
@@ -351,13 +357,28 @@ def tab_market():
     if not ycols:
         st.info("표시할 자산을 선택하세요."); return
 
-    MODE_LABELS = {"price": "가격", "pct": "일반변화율(%)", "pct_log": "로그 변화율(%)", "mdd": "최대 낙폭(MDD)"}
+    MODE_LABELS = {"price": "가격", "pct": "변화율(0% 시작)", "mdd": "최대 낙폭(MDD)"}
     mode = st.radio("표시 방식", options=list(MODE_LABELS.keys()), index=1,
                     horizontal=True, format_func=lambda k: MODE_LABELS[k], key="m_mode")
     st.markdown("<h5>(1) Return Chart</h5>", unsafe_allow_html=True)
 
-    # ===== 유효성 & 숫자화 =====
-    plot_df = view[["Date"] + ycols].copy()
+    # 데이터 가공
+    if mode == "price":
+        plot_df = view[["Date"] + ycols]; y_title = "가격지수"
+    elif mode == "pct":
+        plot_df = rebase_pct(view, ycols); y_title = "누적 수익률 (%)"
+    else:
+        plot_df = drawdown_pct(view, ycols); y_title = "MDD (%, 낮을수록 심함)"
+
+    # 유효성
+    valid_cols = [c for c in ycols if c in plot_df.columns and pd.to_numeric(plot_df[c], errors="coerce").notna().any()]
+    if not valid_cols:
+        candidates = [c for c in plot_df.columns if c != "Date" and pd.to_numeric(plot_df[c], errors="coerce").notna().any()]
+        valid_cols = candidates[:min(3, len(candidates))]
+        st.session_state["m_ycols"] = valid_cols
+    ycols = valid_cols
+
+    plot_df = plot_df[["Date"] + ycols].copy()
     for c in ycols:
         plot_df[c] = pd.to_numeric(plot_df[c], errors="coerce")
     plot_df = plot_df.dropna(subset=ycols, how="all")
@@ -379,103 +400,11 @@ def tab_market():
             lbl = f"{base_lbl} ({c})[{k}]"; k += 1
         unique_map[c] = lbl; used.add(lbl)
 
-    # ===== 데이터 가공 & 그래프 =====
-    if mode == "price":
-        plot_df_use = plot_df.copy()
-        y_title = "가격지수"
-        plot_df_disp = plot_df_use.rename(columns=unique_map)
-        ycols_disp = [unique_map.get(c, c) for c in ycols]
-        fig = px.line(plot_df_disp, x="Date", y=ycols_disp, render_mode="svg")
-        fig.update_yaxes(tickformat=",.1f")
+    plot_df_disp = plot_df.rename(columns=unique_map)
+    ycols_disp = [unique_map.get(c, c) for c in ycols]
 
-    elif mode == "pct":
-        plot_df_use = rebase_pct(plot_df, ycols)  # % 단위
-        y_title = "누적 수익률 (%)"
-        plot_df_disp = plot_df_use.rename(columns=unique_map)
-        ycols_disp = [unique_map.get(c, c) for c in ycols]
-        fig = px.line(plot_df_disp, x="Date", y=ycols_disp, render_mode="svg")
-        fig.update_yaxes(ticksuffix="%", rangemode="tozero")
-
-    elif mode == "pct_log":
-        # (1) 일반 변화율(%) → (2) 배수(= 1 + %/100)로 변환하여 로그축에 그리되,
-        #     눈금은 %처럼 보이도록 커스텀 라벨을 사용
-        pct = rebase_pct(view, ycols).copy()
-        for c in ycols:
-            pct[c] = (pd.to_numeric(pct[c], errors="coerce") / 100.0) + 1.0  # 배수
-
-        plot_df_disp = pct.rename(columns=unique_map)
-        ycols_disp = [unique_map.get(c, c) for c in ycols]
-
-        # 양수(로그 가능) 시리즈만 표시
-        vals = plot_df_disp[ycols_disp].apply(pd.to_numeric, errors="coerce")
-        y_show = [c for c in ycols_disp if (vals[c] > 0).any()]
-        if not y_show:
-            st.info("로그축에 표시할 수 있는 시리즈가 없습니다. 일반 변화율(%)로 확인해 주세요.")
-            return
-
-        # 로그축 눈금: 배수값 → 라벨은 (배수-1)*100%
-        y_min = float(vals[y_show].min().min())
-        y_max = float(vals[y_show].max().max())
-        tick_candidates = [0.25, 0.5, 1, 2, 3, 4, 5, 10, 20, 50, 100]
-        tickvals = [v for v in tick_candidates if v > 0 and y_min * 0.95 <= v <= y_max * 1.05] or [1]
-        if 1 not in tickvals:
-            tickvals = sorted(set(tickvals + [1]))
-        ticktext = [f"{(v - 1) * 100:.0f}%" for v in tickvals]
-
-        y_title = "누적 수익률 (%, 로그 간격)"
-
-        fig = px.line(plot_df_disp, x="Date", y=y_show, render_mode="svg")
-        fig.update_layout(
-            margin=dict(l=10, r=130, t=10, b=10),
-            height=520,
-            yaxis_title=y_title,
-            legend=dict(groupclick="togglegroup"),
-            uirevision="mkt",
-            xaxis_rangeslider_visible=False,
-        )
-        fig.update_yaxes(type="log", tickvals=tickvals, ticktext=ticktext)
-
-        # 마지막값 라벨(%) 표시
-        last_idx = vals.dropna(how="all").index[-1]
-        lx = plot_df_disp.loc[last_idx, "Date"]
-        for c in y_show:
-            sc = plot_df_disp[["Date", c]].dropna()
-            if sc.empty:
-                continue
-            v_last = float(sc.iloc[-1][c])          # 배수
-            pct_last = (v_last - 1.0) * 100.0       # %
-            fig.add_trace(
-                go.Scatter(
-                    x=[lx],
-                    y=[v_last],
-                    mode="markers+text",
-                    text=[f"{pct_last:+.1f}%"],
-                    textposition="middle right",
-                    marker=dict(size=6),
-                    showlegend=False,
-                    hoverinfo="skip",
-                    legendgroup=c,
-                )
-            )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config={"scrollZoom": False, "doubleClick": "reset", "displaylogo": False},
-        )
-        return  # ⬅️ 로그 모드에서는 여기서 종료
-
-
-
-    else:  # mdd
-        plot_df_use = drawdown_pct(plot_df, ycols)  
-        y_title = "MDD (%, 낮을수록 심함)"
-        plot_df_disp = plot_df_use.rename(columns=unique_map)
-        ycols_disp = [unique_map.get(c, c) for c in ycols]
-        fig = px.line(plot_df_disp, x="Date", y=ycols_disp, render_mode="svg")
-        fig.update_yaxes(ticksuffix="%", rangemode="tozero")
-
-    # 공통 레이아웃 & 마커 라벨
+    # ---- 메인 비교 그래프 ----
+    fig = px.line(plot_df_disp, x="Date", y=ycols_disp, render_mode="svg")
     fig.update_layout(
         margin=dict(l=10, r=130, t=10, b=10),
         height=520,
@@ -484,6 +413,10 @@ def tab_market():
         uirevision="mkt",
         xaxis_rangeslider_visible=False,
     )
+    if mode in ("pct", "mdd"):
+        fig.update_yaxes(ticksuffix="%", rangemode="tozero")
+    else:
+        fig.update_yaxes(tickformat=",.1f")
     for tr in fig.data:
         tr.legendgroup = tr.name
 
@@ -501,24 +434,23 @@ def tab_market():
                 marker=dict(size=8),
                 showlegend=False, hoverinfo="skip", legendgroup=c))
     else:
-        last_row = plot_df_disp.dropna().iloc[-1] if not plot_df_disp.dropna().empty else None
-        if last_row is not None:
-            lx = last_row["Date"]
-            for c in [cl for cl in plot_df_disp.columns if cl != "Date"]:
-                sc = plot_df_disp[["Date", c]].dropna()
-                if sc.empty: continue
-                idx_max = sc[c].idxmax(); x_max = sc.loc[idx_max, "Date"]; y_max = sc.loc[idx_max, c]
-                idx_min = sc[c].idxmin(); x_min = sc.loc[idx_min, "Date"]; y_min = sc.loc[idx_min, c]
-                fig.add_trace(go.Scatter(x=[x_max], y=[y_max], mode="markers+text",
-                                         text=[format_tail_value(y_max, mode)], textposition="top right",
+        last_row = plot_df_disp.iloc[-1]; lx = last_row["Date"]
+        for c in ycols_disp:
+            sc = plot_df_disp[["Date", c]].dropna()
+            if sc.empty: continue
+            idx_max = sc[c].idxmax(); x_max = sc.loc[idx_max, "Date"]; y_max = sc.loc[idx_max, c]
+            idx_min = sc[c].idxmin(); x_min = sc.loc[idx_min, "Date"]; y_min = sc.loc[idx_min, c]
+            fig.add_trace(go.Scatter(x=[x_max], y=[y_max], mode="markers+text",
+                                     text=[format_tail_value(y_max, mode)], textposition="top right",
+                                     marker=dict(size=8), showlegend=False, hoverinfo="skip", legendgroup=c))
+            if idx_min != idx_max:
+                fig.add_trace(go.Scatter(x=[x_min], y=[y_min], mode="markers+text",
+                                         text=[format_tail_value(y_min, mode)], textposition="bottom right",
                                          marker=dict(size=8), showlegend=False, hoverinfo="skip", legendgroup=c))
-                if idx_min != idx_max:
-                    fig.add_trace(go.Scatter(x=[x_min], y=[y_min], mode="markers+text",
-                                             text=[format_tail_value(y_min, mode)], textposition="bottom right",
-                                             marker=dict(size=8), showlegend=False, hoverinfo="skip", legendgroup=c))
-                is_last_extreme = (x_max == lx) or (x_min == lx)
-                if not is_last_extreme:
-                    v_last = sc.iloc[-1][c]
+            is_last_extreme = (x_max == lx) or (x_min == lx)
+            if not is_last_extreme:
+                v_last = last_row[c]
+                if not pd.isna(v_last):
                     fig.add_trace(go.Scatter(x=[lx], y=[v_last], mode="markers+text",
                                              text=[format_tail_value(v_last, mode)], textposition="middle right",
                                              marker=dict(size=6), showlegend=False, hoverinfo="skip", legendgroup=c))
@@ -526,7 +458,7 @@ def tab_market():
     st.plotly_chart(fig, use_container_width=True,
                     config={"scrollZoom": False, "doubleClick": "reset", "displaylogo": False})
 
-    # ---- (2) 기간별 수익률 스냅샷 ----
+    # ---- (추가) 기간별 수익률 스냅샷 표 ----
     st.markdown("<h5>(2) Periodic Return</h5>", unsafe_allow_html=True)
     price_df = view[["Date"] + ycols].copy()
     for c in ycols:
@@ -536,7 +468,7 @@ def tab_market():
     rows = []
     for c in ycols:
         s = price_df[c].dropna()
-        row = {"자산": pretty_label(c)}
+        row = {"자산": pretty_label(c)}  # 사람이름 라벨(길면 …)
         for name, d in windows:
             if not s.empty and len(s) > d:
                 val = s.pct_change(d).iloc[-1] * 100.0
@@ -545,6 +477,7 @@ def tab_market():
                 row[f"R_{name}"] = ""
         rows.append(row)
     snap = pd.DataFrame(rows, columns=["자산"] + [f"R_{n}" for n,_ in windows])
+
     st.dataframe(
         snap,
         use_container_width=True,
@@ -559,7 +492,7 @@ def tab_market():
         }
     )
 
-    # ---- (3) 단일 자산 이동평균 ----
+    # ---- (추가) 단일 자산 이동평균 ----
     one = st.selectbox("자산 선택", options=ycols, index=0, key="m_ma_one")
     one_label = pretty_label(one)
 
@@ -579,13 +512,18 @@ def tab_market():
                 x=disp_ma["Date"], y=disp_ma[col],
                 mode="lines", name=f"SMA{w}",
                 line=dict(dash="dot")))
+    # 세로 높이 넉넉히
     fig_ma.update_layout(height=600, margin=dict(l=10, r=130, t=30, b=10),
                          uirevision="mkt_ma", xaxis_rangeslider_visible=False)
     st.plotly_chart(fig_ma, use_container_width=True)
 
-    # ---- (4) Company Info (Finviz) ----
+    # ==================== (4) Company Info (Finviz) ====================
     st.markdown("<h5>(4) Company Info</h5>", unsafe_allow_html=True)
-    default_fv = one if re.match(r"^[A-Za-z]{1}[A-Za-z0-9\.\-]{0,9}$", str(one)) else "TSLA"
+
+    # 기본값: 위에서 선택한 단일 자산(one)을 시도하되, 지수/FX일 수 있으니 기본값 TSLA 준비
+    import re as _re
+    default_fv = one if _re.match(r"^[A-Za-z]{1}[A-Za-z0-9\.\-]{0,9}$", str(one)) else "TSLA"
+
     c_fv1, c_fv2 = st.columns([0.22, 0.78])
     with c_fv1:
         finviz_ticker = st.text_input("Ticker", value=default_fv, key="m_finviz_ticker")
@@ -596,19 +534,24 @@ def tab_market():
         with st.spinner("회사 정보 수집 중..."):
             _out = fetch_finviz_company(finviz_ticker)
             if isinstance(_out, tuple) and len(_out) == 3:
-                profile_text, fv_table, _ = _out
+                profile_text, fv_table, src = _out
             else:
                 profile_text, fv_table = _out
+                src = None
 
+        # 회사 소개
         st.markdown(profile_text)
+
+        # Key Metrics 표
         if not fv_table.empty:
             st.dataframe(fv_table, use_container_width=True, hide_index=True, height=400)
         else:
             st.info("표시할 Key Metrics가 없습니다.")
 
+
     # ---- 다운로드 ----
     st.markdown("#### 데이터 다운로드")
-    dl_df = (rebase_pct(view, ycols) if mode in ("pct","pct_log","mdd") else view)[["Date"] + ycols].copy()
+    dl_df = plot_df[["Date"] + ycols].copy()
     csv_key = f"mkt_csv_{mode}_{start}_{end}"
     xlsx_key = f"mkt_xlsx_{mode}_{start}_{end}"
     st.download_button(
@@ -727,6 +670,7 @@ def tab_portfolio():
     ])
     st.session_state.setdefault("weights_df", default_df.copy())
 
+    # --- 표 + 오른쪽 상단 "반영" 버튼 (st.form) ---
     with st.form("weights_form", clear_on_submit=False):
         h1, h2 = st.columns([1.0, 0.14])
         with h1:
@@ -747,10 +691,12 @@ def tab_portfolio():
             },
         )
 
+    # 버튼 눌렀을 때만 상태 반영
     if "apply_weights" in locals() and apply_weights:
         st.session_state["weights_df"] = edited.copy()
         st.success("가중치를 반영했습니다.")
 
+    # 이후 계산에 사용할 현재 가중치 테이블
     edit_df = st.session_state["weights_df"].copy()
 
     up = st.file_uploader("CSV 업로드(컬럼: 티커, P1(%), P2(%), P3(%))", type=["csv"], key="p_upload")
@@ -786,6 +732,7 @@ def tab_portfolio():
         raw_px = fetch_yf_prices(tickers, start, end, use_adjust=True)
     if raw_px.empty: st.warning("가격 데이터를 가져오지 못했습니다."); st.stop()
 
+    # 각 티커 시작일 안내
     starts = {}
     for col in [c for c in raw_px.columns if c != "Date"]:
         s = raw_px[["Date", col]].dropna()
@@ -795,17 +742,18 @@ def tab_portfolio():
                                 "데이터 시작일": [str(starts[k]) if starts[k] else "-" for k in starts]})
         st.table(info_df)
 
+    # 리샘플(옵션)
     px_df = raw_px.copy()
-    if st.session_state.get("p_lite", False):
+    if lite:
         px_df = px_df.set_index("Date").resample("W-FRI").last().reset_index()
 
+    # 환산(USD↔KRW)
     usdkrw = None
     if "KRW=X" not in px_df.columns:
         fx = fetch_yf_prices(("KRW=X",), start, end, use_adjust=False)
         if not fx.empty:
             fx_df = fx.rename(columns={"KRW=X":"USDKRW"})
-            if st.session_state.get("p_lite", False):
-                fx_df = fx_df.set_index("Date").resample("W-FRI").last().reset_index()
+            if lite: fx_df = fx_df.set_index("Date").resample("W-FRI").last().reset_index()
             usdkrw = fx_df.set_index("Date")["USDKRW"]
 
     base_ccy = st.session_state.get("p_ccy", "USD")
@@ -821,6 +769,7 @@ def tab_portfolio():
 
     prices = px_df.set_index("Date")
 
+    # 리밸런싱 모드/주기
     rb_mode = st.session_state.get("p_rbmode", "없음(바이앤홀드)")
     mode = "BH" if rb_mode.startswith("없음") else "RB"
     freq = "M" if rb_mode.startswith("매월") else ("Q" if rb_mode.startswith("분기") else "A")
@@ -838,14 +787,14 @@ def tab_portfolio():
                                                   fee_bps=st.session_state.get("p_fee",0.0), reb_freq=freq)
         eq.name = nm; portfolios.append((nm, eq))
 
+    # 벤치마크
     bench = st.session_state.get("p_bench","SPY")
     bench_line = None
     bench_name = bench.strip().upper() if bench.strip() else None
     if bench_name:
         bpx = fetch_yf_prices((bench_name,), start, end, use_adjust=True)
         if not bpx.empty:
-            if st.session_state.get("p_lite", False):
-                bpx = bpx.set_index("Date").resample("W-FRI").last().reset_index()
+            if lite: bpx = bpx.set_index("Date").resample("W-FRI").last().reset_index()
             bser = bpx.set_index("Date")[bench_name]
             if usdkrw is not None:
                 cur_kr = bench_name.endswith(".KS") or bench_name.endswith(".KQ")
@@ -853,6 +802,7 @@ def tab_portfolio():
                 elif base_ccy == "USD" and cur_kr: bser = bser / usdkrw
             bench_line = (bser / bser.dropna().iloc[0]).rename(bench_name)
 
+    # 누적 수익률(%) 차트
     idx = None
     for _, s in portfolios:
         if s is not None and not s.empty:
@@ -876,6 +826,7 @@ def tab_portfolio():
     fig.update_yaxes(ticksuffix="%")
     for tr in fig.data: tr.legendgroup = tr.name
 
+    # 마지막값 & 최저점 라벨
     last = df_plot.dropna().iloc[-1]; lx = last["Date"]
     for c in df_plot.columns[1:]:
         sc = df_plot[["Date", c]].dropna()
@@ -891,6 +842,7 @@ def tab_portfolio():
                                  marker=dict(size=8), showlegend=False, hoverinfo="skip", legendgroup=c))
     st.plotly_chart(fig, use_container_width=True)
 
+    # MDD(%) 비교 — 벤치마크 포함
     comp = pd.DataFrame(index=idx).sort_index()
     for nm, s in portfolios:
         if not s.empty:
@@ -910,6 +862,7 @@ def tab_portfolio():
         for tr in fig2.data: tr.legendgroup = tr.name
         st.plotly_chart(fig2, use_container_width=True)
 
+    # 요약 지표
     st.markdown("#### 요약 지표")
     rows = []
     for nm, s in portfolios:
@@ -927,6 +880,7 @@ def tab_portfolio():
         sumdf = pd.DataFrame(rows, columns=["포트폴리오/벤치","CAGR","연변동성","Sharpe","MDD","Calmar"])
         st.table(sumdf)
 
+    # 다운로드
     out = pd.DataFrame(index=idx).sort_index().rename_axis("Date").reset_index()
     for nm, s in portfolios:
         if not s.empty:
@@ -963,6 +917,7 @@ def tab_portfolio():
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=xlsx_key,
     )
+
 
 # ==================== TAB 3: Analysis (트렌드/모멘텀 제거) ====================
 def _coerce_date(s: pd.Series) -> pd.Series:
@@ -1099,9 +1054,11 @@ def tab_research_global():
     st.markdown("**펀드 NAV 파일 업로드(CSV/XLSX)** — 컬럼 예시: `일자, 기준가` 또는 `Date, Close`")
     fund_files = st.file_uploader("여러 개 업로드 가능", type=["csv","xls","xlsx"], accept_multiple_files=True)
 
+    # 데이터 수집
     with st.spinner("데이터 불러오는 중..."):
         yf_long = fetch_yf_ohlcv(tuple(parsed), start, end, use_adjust=use_adj) if parsed else \
                   pd.DataFrame(columns=["Date","Ticker","Close","High","Low","Volume"])
+        # 펀드 파일 간단 병합 (원래 코드의 상세 어댑터는 생략)
         fd_long = pd.DataFrame(columns=["Date","Ticker","Close"])
 
     frames = [df for df in [yf_long, fd_long] if df is not None and not df.empty]
@@ -1113,6 +1070,7 @@ def tab_research_global():
 
     data = compute_price_indicators(base_long)["data"]
 
+    # (중요) 하위 탭에서 "📈 트렌드/모멘텀" 탭 제거
     tB, tC, tD = st.tabs(["⚠️ 변동성·MDD·ATR/OBV", "🔗 상관·페어", "🧪 시나리오"])
 
     with tB:
