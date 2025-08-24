@@ -7,4 +7,5 @@ requests
 openpyxl
 xlrd
 numpy
-lxml
+beautifulsoup4
+lxml>=5.1.0
