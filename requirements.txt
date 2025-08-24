@@ -7,3 +7,4 @@ requests
 openpyxl
 xlrd
 numpy
+lxml
