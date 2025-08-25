@@ -5,7 +5,6 @@ import os, re, math, time
 from io import BytesIO
 from datetime import date
 import html as ihtml
-from lxml import etree
 
 import pandas as pd
 import plotly.express as px
@@ -13,7 +12,6 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 import requests
-
 
 st.set_page_config(page_title="Market Performance", layout="wide")
 
@@ -34,436 +32,19 @@ if APP_PW:
     if pw != APP_PW:
         st.stop()
 
-# ---------- 펀드 매핑: 로드 & 검색 유틸 ----------
-FUND_MAP_PATHS = [
-    os.path.join(BASE_DIR, "data", "fundcodematching.xlsx"),  # 권장
-    os.path.join(BASE_DIR, "data", "fundcodematching.xls"),    # 구버전
-    os.path.join(BASE_DIR, "fundcodematching.xlsx"),
-    os.path.join(BASE_DIR, "fundcodematching.xls"),
-]
-
-def _first_existing(paths):
-    for p in paths:
-        if os.path.exists(p):
-            return p
-    return None
-
-def _truncate20(s: str) -> str:
-    s = str(s).strip()
-    return (s[:20] + "…") if len(s) > 20 else s
-
-def _norm(s: str) -> str:
-    # 공백/구두점 제거 + 소문자화 (한글 포함 단순 부분일치용)
-    import re
-    return re.sub(r"[\s\W_]+", "", str(s)).lower()
-
-@st.cache_data(ttl=600, show_spinner=False)
-def load_fund_map():
-    """
-    엑셀/CSV에서 (코드, 펀드명) 매핑 로드.
-    지원 컬럼명(대소문자 무관):
-      - 코드: 'code','fund_code','펀드코드','코드'
-      - 이름: 'name','fund_name','펀드명','이름'
-    """
-    path = _first_existing(FUND_MAP_PATHS)
-    if not path:
-        return pd.DataFrame(columns=["code","name","name20","norm_name"])
-
-    # 확장자에 따라 읽기
-    ext = os.path.splitext(path)[1].lower()
-    if ext in (".xlsx",):
-        df = pd.read_excel(path, engine="openpyxl")
-    elif ext in (".xls",):
-        # xlrd가 필요합니다(로컬 requirements에 이미 포함하신 것으로 알고 있습니다)
-        df = pd.read_excel(path)  # engine 자동
-    else:
-        df = pd.read_csv(path)
-
-    # 컬럼명 정규화
-    cols = {c.lower(): c for c in df.columns}
-    code_col = next((cols[k] for k in cols if k in ("code","fund_code","펀드코드","코드")), None)
-    name_col = next((cols[k] for k in cols if k in ("name","fund_name","펀드명","이름")), None)
-    if not code_col or not name_col:
-        # 안전장치: A열=코드, B열=펀드명 가정
-        df = df.copy()
-        df.columns = [f"col{i+1}" for i in range(len(df.columns))]
-        name_col, code_col = "col1","col2"   # A=펀드명, B=코드
-
-    out = df[[code_col, name_col]].rename(columns={code_col:"code", name_col:"name"}).copy()
-    out["code"] = out["code"].astype(str).str.strip().str.upper()
-    out["name"] = out["name"].astype(str).str.strip()
-    out = out.dropna(subset=["code","name"]).drop_duplicates(subset=["code"])
-    out["name20"] = out["name"].map(_truncate20)
-    out["norm_name"] = out["name"].map(_norm)
-    return out
-
-FUND_MAP = load_fund_map()
-FUND_CODE_SET = set(FUND_MAP["code"]) if not FUND_MAP.empty else set()
-
-def resolve_terms_to_codes(terms: list[str]) -> tuple[list[str], dict]:
-    """
-    사용자가 입력한 토큰 목록을 → (확정 코드 리스트, 라벨맵)으로 변환
-    - 토큰이 이미 티커(코드)이면 그대로
-    - 아니면 펀드명 부분일치 검색으로 code를 찾아 추가
-    라벨맵: {코드: 표시명(20자 절단)}
-    """
-    codes = []
-    label_map = {}
-
-    # 사전생성: norm_name -> code (다대일 허용 위해 검색은 contains로)
-    for t in terms:
-        if not t:
-            continue
-        t_clean = t.strip()
-        # 이미 코드로 들어온 경우 (대문자/숫자/기호 혼합 허용)
-        if t_clean.upper() in FUND_CODE_SET:
-            codes.append(t_clean.upper())
-            # label 준비
-            row = FUND_MAP.loc[FUND_MAP["code"]==t_clean.upper()].head(1)
-            if not row.empty:
-                nm = row.iloc[0]["name20"]
-                label_map[t_clean.upper()] = nm
-            continue
-
-        # 이름 검색 (부분일치)
-        tnorm = _norm(t_clean)
-        hits = FUND_MAP.loc[FUND_MAP["norm_name"].str.contains(tnorm, na=False)]
-        if not hits.empty:
-            for code, nm20 in zip(hits["code"], hits["name20"]):
-                codes.append(code)
-                label_map[code] = nm20
-
-    # 중복 제거(입력 순서 보존)
-    seen = set()
-    uniq = []
-    for c in codes:
-        if c not in seen:
-            uniq.append(c)
-            seen.add(c)
-
-    return uniq, label_map
-
-import yfinance as yf
-
-def search_ticker_or_fund(query: str):
-    q = query.strip().upper()
-    if not q:
-        return []
-
-    # 1. 야후 티커 시도
-    try:
-        test = yf.Ticker(q)
-        hist = test.history(period="1d")
-        if not hist.empty:
-            return [q]   # ✅ 야후에서 바로 데이터 있으면 그대로 반환
-    except Exception:
-        pass
-
-    # 2. 펀드 매핑 검색
-    matches_code = FUND_MAP.loc[FUND_MAP["code"].str.upper() == q]
-    matches_name = FUND_MAP.loc[FUND_MAP["name"].str.upper() == q]
-    if not matches_code.empty or not matches_name.empty:
-        return list(matches_code["code"]) + list(matches_name["code"])
-
-    # 3. 부분검색 (너무 짧은 건 스킵)
-    if len(q) > 2:
-        hits = FUND_MAP.loc[FUND_MAP["norm_name"].str.contains(q.lower(), na=False)]
-        return list(hits["code"])
-
-    return []
-
-
-def pretty_label_with_fund(code_or_ticker: str) -> str:
-    """
-    그래프 라벨에 사용할 표시명:
-    - FUND_MAP에 있으면 펀드명(20자)
-    - 없으면 기존 pretty_label(code_or_ticker) 결과 사용
-    """
-    c = str(code_or_ticker).upper()
-    hit = FUND_MAP.loc[FUND_MAP["code"]==c]
-    if not hit.empty:
-        return hit.iloc[0]["name20"]
-    # (기존 pretty_label 이 이미 있다면 그걸 호출하세요)
-    try:
-        return pretty_label(c)  # 당신의 기존 함수
-    except Exception:
-        return c
-    
-    def label_of(sym: str) -> str:
-        s = str(sym).strip().upper()
-        if not FUND_MAP.empty and "code" in FUND_MAP.columns:
-            hit = FUND_MAP.loc[FUND_MAP["code"] == s]
-            if not hit.empty:
-                return hit.iloc[0]["name20"]  # 20자 절단 펀드명
-        return pretty_label(s)
-
-# ==== KOFIA(DIS) XML endpoint helpers ========================================
-KOFIA_URL = "https://dis.kofia.or.kr/proframeWeb/XMLSERVICES/"
-
-def _truncate_bytes(s: str, max_bytes: int = 20, encoding="utf-8") -> str:
-    b = s.encode(encoding)[:max_bytes]
-    while True:
-        try:
-            return b.decode(encoding)
-        except UnicodeDecodeError:
-            b = b[:-1]
-
-def is_kofia_code(tok: str) -> bool:
-    """펀드 코드 판별: 
-       - 국내 ISIN: KR + 10 digits (예: KR5370199261)
-       - 단축코드: 4~6 digits (예: 19926)
-       - 일부 운용사 전용 코드: K + 11 alnum (예: K55235B39924)
-    """
-    if not tok:
-        return False
-    t = tok.strip().upper()
-    return bool(re.fullmatch(r"(KR\d{10}|K[A-Z0-9]{11}|\d{4,6})", t))
-
-
-# === 공용 날짜 파서(YYYYMMDD 우선, 그 외 포맷도 수용) ===
-def _parse_date_series(s: pd.Series) -> pd.Series:
-    """
-    1) 8자리 YYYYMMDD 우선 시도
-    2) 구분자 통일 후 자유 파싱
-    3) 여전히 None이면 YYYYMMDD 재시도
-    ※ infer_datetime_format 옵션 제거(신버전 경고 방지)
-    """
-    raw = s.astype(str).str.strip()
-
-    # 1) YYYYMMDD 직접 파싱
-    dt_a = pd.to_datetime(raw, errors="coerce", format="%Y%m%d")
-    if dt_a.notna().sum() >= max(3, int(len(raw) * 0.3)):
-        return dt_a
-
-    # 2) 구분자 통일 + 패턴 추출 후 파싱
-    norm = (raw.str.replace(".", "-", regex=False)
-                .str.replace("/", "-", regex=False))
-    # 'YYYY-MM-DD' 패턴 우선 추출, 없으면 원문
-    norm2 = norm.str.extract(r"(\d{4}-?\d{2}-?\d{2})", expand=False).fillna(norm)
-    dt_b = pd.to_datetime(norm2, errors="coerce")
-
-    # 3) 숫자만 남겨 YYYYMMDD 재시도
-    norm3 = norm2.str.replace("-", "", regex=False)
-    dt_c = pd.to_datetime(norm3, errors="coerce", format="%Y%m%d")
-
-    return dt_b.where(dt_b.notna(), dt_c)
-
-def _kofia_xml_payload(start_ymd: str, end_ymd: str, fund_id: str) -> str:
-    return f"""<?xml version="1.0" encoding="utf-8"?>
-<message>
-  <proframeHeader>
-    <pfmAppName>FS-DIS2</pfmAppName>
-    <pfmSvcName>DISFundStdPrcStutSO</pfmSvcName>
-    <pfmFnName>select</pfmFnName>
-  </proframeHeader>
-  <systemHeader></systemHeader>
-  <DISCondFuncDTO>
-    <tmpV30>{start_ymd}</tmpV30>
-    <tmpV31>{end_ymd}</tmpV31>
-    <tmpV10>0</tmpV10>
-    <tmpV12>{fund_id}</tmpV12>
-  </DISCondFuncDTO>
-</message>""".strip()
-
-# --- (NEW) KOFIA XML에서 펀드명을 어디에 있어도 찾아내기 ---
-def _extract_kofia_name_from_xml(xml_bytes: bytes) -> str | None:
-    try:
-        root = etree.fromstring(xml_bytes)
-    except Exception:
-        return None
-
-    # 1) 가장 가능성 높은 태그들 우선
-    name_tags = [
-        "fundNm", "fundName",
-        "fnccFundNm", "fnccFundNm1", "fnccFundNm2",
-        "vGridBtn1", "vGridBtn2", "ext1", "ext2", "tmpV5", "tmpV4"
-    ]
-    for tag in name_tags:
-        vals = root.xpath(f'//*[local-name()="{tag}"]/text()')
-        for v in vals:
-            s = (v or "").strip()
-            if not s:
-                continue
-            # vGridBtn1 등은 <a>태그가 섞여 올 수 있으니 태그 제거
-            s = re.sub(r"<[^>]*>", "", s)
-            s = re.sub(r"\s+", " ", s).strip()
-            if s:
-                return s
-
-    # 2) 혹시 속성(attribute)에 이름이 들어오는 케이스도 방어
-    cand_nodes = root.xpath('//*[@*]')
-    for node in cand_nodes:
-        for _, attr_val in getattr(node, 'attrib', {}).items():
-            s = re.sub(r"<[^>]*>", "", (attr_val or "")).strip()
-            if s and len(s) >= 3 and not s.isdigit():
-                return s
-
-    return None
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_kofia_nav_xml(code: str, start, end) -> pd.DataFrame:
-    """
-    KOFIA(DIS)에서 펀드 기준가(NAV)를 ['Date', code, (optional) 'fundNm']로 반환.
-      - Date  : tmpV1 (YYYYMMDD)
-      - Price : tmpV2 (기준가격, 원)
-      - Name  : XML 어디에 있든 최대한 찾아 'fundNm'로 동봉
-    """
-    code = (code or "").strip()
-    if not code:
-        return pd.DataFrame(columns=["Date"])
-
-    def _yyyymmdd(d): return pd.Timestamp(d).strftime("%Y%m%d")
-    payload = _kofia_xml_payload(_yyyymmdd(start), _yyyymmdd(end), code)
-    headers = {
-        "Content-Type": "text/xml; charset=UTF-8",
-        "Accept": "text/xml,application/xml,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0",
-    }
-
-    # --- 요청 ---
-    try:
-        r = requests.post(KOFIA_URL, data=payload.encode("utf-8"), headers=headers, timeout=20)
-        if not r.ok:
-            st.warning(f"KOFIA HTTP 오류({code}): {r.status_code}")
-            return pd.DataFrame(columns=["Date"])
-        xml_bytes = r.content
-    except Exception as e:
-        st.warning(f"KOFIA 요청 실패({code}): {e}")
-        return pd.DataFrame(columns=["Date"])
-
-    # --- 파싱 ---
-    try:
-        root = etree.fromstring(xml_bytes)
-        nodes = root.xpath('//*[local-name()="DISCondFuncListDTO"]/*')
-        if not nodes:
-            nodes = root.xpath('//*[local-name()="DISCondFuncDTO"]')
-
-        rows = []
-        for n in nodes:
-            row = {}
-            for c in n.iterchildren():
-                try:
-                    k = etree.QName(c.tag).localname
-                except Exception:
-                    k = (str(c.tag).split("}")[-1] if "}" in str(c.tag) else str(c.tag))
-                row[k] = (c.text or "").strip()
-            if any(v for v in row.values()):
-                rows.append(row)
-        if not rows:
-            return pd.DataFrame(columns=["Date"])
-
-        df = pd.DataFrame(rows).reset_index(drop=True)
-
-        # 필수 컬럼 확인
-        if "tmpV1" not in df.columns or "tmpV2" not in df.columns:
-            st.warning(f"KOFIA 응답 스키마 변경 가능성({code}). cols={list(df.columns)}")
-            return pd.DataFrame(columns=["Date"])
-
-        # 날짜/가격
-        dates = pd.to_datetime(df["tmpV1"].astype(str), errors="coerce", format="%Y%m%d")
-        price = pd.to_numeric(
-            df["tmpV2"].astype(str).str.replace(",", "", regex=False).str.replace(" ", "", regex=False),
-            errors="coerce"
-        )
-
-        # --- (핵심) 펀드명은 문서 전체에서 스캔 ---
-        fund_name = None
-        # 1순위: 명시적 컬럼
-        if "fundNm" in df.columns and df["fundNm"].notna().any():
-            fund_name = str(df["fundNm"].dropna().iloc[0]).strip()
-        # 2순위: 문서 전체 스캔 (vGridBtn1, ext1 등 포함)
-        if not fund_name:
-            fund_name = _extract_kofia_name_from_xml(xml_bytes)
-
-        out = pd.DataFrame({"Date": dates, code: price})
-        if fund_name:
-            out["fundNm"] = fund_name
-
-        out[code] = pd.to_numeric(out[code], errors="coerce")
-
-        out = out.dropna(subset=["Date"])
-        mask = (out["Date"].dt.date >= pd.to_datetime(start).date()) & \
-            (out["Date"].dt.date <= pd.to_datetime(end).date())
-        out = out.loc[mask].sort_values("Date").reset_index(drop=True)
-
-        cols = ["Date", code] + (["fundNm"] if "fundNm" in out.columns else [])
-        return out[cols]
-
-    except Exception as e:
-        st.warning(f"KOFIA 파싱 실패({code}): {e}")
-        return pd.DataFrame(columns=["Date"])
-
+# -------------------- 범례용 라벨 --------------------
 @st.cache_data(ttl=86400)
 def pretty_label(symbol: str) -> str:
-    """
-    표시용 라벨:
-      - KOFIA 코드: 변환 없이 그대로 반환 (예: KR5370199261)
-      - 야후 티커: shortName/longName → 없으면 티커
-      - 너무 길면 20자 '...' 처리
-    """
-    s = (symbol or "").strip().upper()
-    if not s:
-        return ""
-
-    # KOFIA 코드는 그대로
-    if is_kofia_code(s):
-        return s
-
-    # 야후 티커 이름 가져오기
+    """야후에서 짧은 이름을 가져와 사람이 읽기 쉬운 라벨 생성. 길면 10자 + '...'"""
     try:
-        info = yf.Ticker(s).info or {}
+        info = yf.Ticker(symbol).info or {}
     except Exception:
         info = {}
-    name = info.get("shortName") or info.get("longName") or s
-    return (name[:20] + "...") if len(name) > 20 else name
-
-@st.cache_data(ttl=1200, show_spinner=False)
-def fetch_prices_mixed(tickers: tuple, start, end, use_adjust=True) -> pd.DataFrame:
-    """
-    - 야후 티커는 fetch_yf_prices로
-    - KOFIA(펀드코드: ISIN KRxxxxxxxxxx 또는 4~6자리 단축코드)는 fetch_kofia_nav_xml로
-    안전하게 합쳐서 반환. 최소한 ['Date'] 컬럼은 항상 보장.
-    """
-    if not tickers:
-        return pd.DataFrame(columns=["Date"])
-
-    kofia_like, yahoo_like = [], []
-    for t in tickers:
-        t = (t or "").strip()
-        if not t:
-            continue
-        if is_kofia_code(t):
-            kofia_like.append(t)
-        else:
-            yahoo_like.append(t)
-
-    frames = []
-
-    # 1) Yahoo
-    if yahoo_like:
-        yf_df = fetch_yf_prices(tuple(yahoo_like), start, end, use_adjust=use_adjust)
-        if isinstance(yf_df, pd.DataFrame) and not yf_df.empty and "Date" in yf_df.columns:
-            frames.append(yf_df)
-
-    # 2) KOFIA
-    for code in kofia_like:
-        df_k = fetch_kofia_nav_xml(code, start, end)
-        if isinstance(df_k, pd.DataFrame) and not df_k.empty and "Date" in df_k.columns:
-            frames.append(df_k)
-        else:
-            st.info(f"KOFIA 데이터 없음 또는 코드 확인 필요: {code}")
-
-    if not frames:
-        return pd.DataFrame(columns=["Date"])
-
-    out = frames[0]
-    for f in frames[1:]:
-        if "Date" not in f.columns:
-            continue
-        out = pd.merge(out, f, on="Date", how="outer")
-
-    return out.sort_values("Date").reset_index(drop=True)
+    name = info.get("shortName") or info.get("longName") or symbol
+    country = info.get("country") or info.get("exchange") or ""
+    qtype = (info.get("quoteType") or "").upper()
+    label = " · ".join([v for v in [name, country, qtype] if v])
+    return (label[:10] + "...") if len(label) > 10 else label
 
 # -------------------- 이름→티커 보편 별칭 --------------------
 COMMON_ALIASES = {
@@ -507,7 +88,7 @@ def fetch_finviz_company(ticker: str):
 
         # 회사 소개
         from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")  # lxml 없어도 동작
         node = soup.select_one('td.fullview-profile') or soup.select_one('td[class*="fullview-profile"]')
         profile_text = None
         if node:
@@ -638,34 +219,13 @@ def fetch_yf_prices(tickers: tuple, start, end, use_adjust=True) -> pd.DataFrame
     close = close.ffill().bfill(limit=1)
     return close.reset_index()
 
-def reindex_fill_ffill_bfill(df: pd.DataFrame, start, end, ffill_limit: int = 5, kofia_ffill_limit: int = 5) -> pd.DataFrame:
-    """
-    영업일 기준으로 리인덱스.
-    - 야후 열: 짧게 ffill (기본 5일)
-    - KOFIA 열: 과도한 단절 방지 위해 동일하게 ffill (기본 5일)
-      (bfill은 적용하지 않음)
-    """
-    all_days = pd.bdate_range(start=start, end=end)
-    out = df.set_index("Date").reindex(all_days)
-
-    # 숫자화
+def reindex_fill_ffill_bfill(df: pd.DataFrame, start, end) -> pd.DataFrame:
+    all_days = pd.date_range(start=start, end=end, freq="D")
+    out = (df.set_index("Date").reindex(all_days).ffill().bfill()
+           .rename_axis("Date").reset_index())
     num_cols = [c for c in out.columns if c != "Date"]
     out[num_cols] = out[num_cols].apply(pd.to_numeric, errors="coerce")
-
-    # 구분
-    kofia_cols = [c for c in out.columns if c != "Date" and is_kofia_code(str(c))]
-    other_cols = [c for c in out.columns if c != "Date" and c not in kofia_cols]
-
-    # 야후: 짧게 ffill
-    if other_cols:
-        out[other_cols] = out[other_cols].ffill(limit=ffill_limit)
-
-    # KOFIA(펀드): 공백 제거용 ffill (짧은 한도 내)
-    if kofia_cols:
-        out[kofia_cols] = out[kofia_cols].ffill(limit=kofia_ffill_limit)
-
-    return out.rename_axis("Date").reset_index()
-
+    return out
 
 def rebase_pct(frame: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     out = frame[["Date"] + cols].copy()
@@ -737,9 +297,9 @@ def tab_market():
         st.session_state.setdefault("m_tickers", "")
         col_inp, col_btn = st.columns([4, 1])
         with col_inp:
-            st.text_input("티커/펀드코드 입력 (야후 + KOFIA 혼용 가능)",
+            st.text_input("티커 입력",
                           key="m_tickers",
-                          placeholder="예: SPY, ^KS11, 005930.KS, KR5370199261, 19926")
+                          placeholder="예: SPY, ^KS11, 005930.KS")
         with col_btn:
             st.markdown("<div style='height:26px'></div>", unsafe_allow_html=True)
             fetch_clicked = st.button("반영", type="primary", use_container_width=True, key="m_fetch")
@@ -753,66 +313,33 @@ def tab_market():
     st.session_state.setdefault("m_ycols", [])
 
     def expand_aliases(seq):
-        # 별칭만 확장, KOFIA 코드는 그대로 둠
-        out = []
-        for t in seq:
-            out.append(COMMON_ALIASES.get(t.lower(), t))
-        return out
+        return [COMMON_ALIASES.get(t.lower(), t) for t in seq]
 
-    # 저장된 추가 자산
+    # 저장된 추가 티커
     saved = tuple(st.session_state["m_extra"])
     if saved:
-        fetched_saved = fetch_prices_mixed(saved, start, end, use_adjust=use_adj)
+        fetched_saved = fetch_yf_prices(saved, start, end, use_adjust=use_adj)
         if not fetched_saved.empty:
             view = pd.merge(view, fetched_saved, on="Date", how="outer").sort_values("Date")
 
-    
     # 신규 추가
-    new_only = []
     if fetch_clicked:
-        raw_terms = [t for t in re.split(r"[,\s]+", st.session_state.get("m_tickers","")) if t.strip()]
-        terms = expand_aliases(raw_terms)
-
-        all_codes, seen = [], set()
-        for t in terms:
-            t_clean = t.strip().upper()
-
-            # ✅ Market 탭에서는 펀드명 검색 금지 → 정확한 코드만 허용
-            if t_clean in FUND_CODE_SET or is_kofia_code(t_clean):
-                hits = [t_clean]
-            else:
-                # 야후 티커 확인
-                try:
-                    hist = yf.Ticker(t_clean).history(period="1d")
-                    hits = [t_clean] if not hist.empty else []
-                except Exception:
-                    hits = []
-
-            for h in hits:
-                if h not in seen:
-                    all_codes.append(h)
-                    seen.add(h)
-
-        # 5) 이미 있는 컬럼/추가목록 제외 후 새로 가져오기
+        parsed = [t.upper() for t in re.split(r"[,\s]+", st.session_state.get("m_tickers","")) if t.strip()]
+        parsed = expand_aliases(parsed)
         already = set(view.columns) | set(st.session_state["m_extra"])
-        new_only = [t for t in all_codes if t not in already]
-
-    if new_only:
-        with st.spinner(f"가격 불러오는 중... ({', '.join(new_only)})"):
-            fetched_now = fetch_prices_mixed(tuple(new_only), start, end, use_adjust=use_adj)
-        if not fetched_now.empty:
-            # ⚠️ fundNm 컬럼 충돌 방지
-            if "fundNm" in fetched_now.columns:
-                fetched_now = fetched_now.drop(columns=["fundNm"])
-
-            view = pd.merge(view, fetched_now, on="Date", how="outer").sort_values("Date")
-            st.session_state["m_extra"] = sorted(set(st.session_state["m_extra"]) | set(new_only))
-            st.session_state["m_ycols"] = list(
-                dict.fromkeys(st.session_state.get("m_ycols", []) + new_only)
-            )
-            st.success(f"추가된 자산: {', '.join(new_only)}")
+        new_only = [t for t in parsed if t not in already]
+        if new_only:
+            with st.spinner(f"야후에서 불러오는 중... ({', '.join(new_only)})"):
+                fetched_now = fetch_yf_prices(tuple(new_only), start, end, use_adjust=use_adj)
+            if not fetched_now.empty:
+                view = pd.merge(view, fetched_now, on="Date", how="outer").sort_values("Date")
+                st.session_state["m_extra"] = sorted(set(st.session_state["m_extra"]) | set(new_only))
+                st.session_state["m_ycols"] = list(
+                    dict.fromkeys(st.session_state.get("m_ycols", []) + new_only)
+                )
+                st.success(f"추가된 티커: {', '.join(new_only)}")
         else:
-            st.info("새로 추가할 항목이 없습니다.")
+            st.info("새로 추가할 티커가 없습니다.")
 
     # 리인덱싱
     view = reindex_fill_ffill_bfill(view, start, end)
@@ -820,8 +347,7 @@ def tab_market():
     all_cols = [c for c in view.columns if c != "Date"]
     init_default = all_cols[:min(3, len(all_cols))]
     st.session_state["m_ycols"] = [c for c in st.session_state.get("m_ycols", init_default) if c in all_cols] or init_default
-    ycols = st.multiselect("표시할 자산", options=all_cols, key="m_ycols", format_func=pretty_label_with_fund)
-
+    ycols = st.multiselect("표시할 자산", options=all_cols, key="m_ycols")
     if not ycols:
         st.info("표시할 자산을 선택하세요."); return
 
@@ -839,15 +365,15 @@ def tab_market():
         st.info("표시 가능한 데이터가 없습니다. 기간/티커를 조정해 주세요.")
         return
 
-       # 라벨 유일화
+    # 라벨 유일화
     from collections import Counter
     ycols = [c for c in ycols if c in plot_df.columns]
-    base_map = {c: pretty_label_with_fund(c) for c in ycols}
+    base_map = {c: pretty_label(c) for c in ycols}
     cnt = Counter(base_map.values())
     unique_map, used = {}, set()
     for c in ycols:
         base_lbl = base_map[c]
-        lbl = base_lbl
+        lbl = base_lbl if cnt[base_lbl] == 1 else f"{base_lbl} ({c})"
         k = 2
         while lbl in used:
             lbl = f"{base_lbl} ({c})[{k}]"; k += 1
@@ -858,9 +384,8 @@ def tab_market():
         plot_df_use = plot_df.copy()
         y_title = "가격지수"
         plot_df_disp = plot_df_use.rename(columns=unique_map)
-        ycols_disp = list(unique_map.values())  # ← 무조건 라벨만 사용
+        ycols_disp = [unique_map.get(c, c) for c in ycols]
         fig = px.line(plot_df_disp, x="Date", y=ycols_disp, render_mode="svg")
-        fig.update_traces(connectgaps=True)
         fig.update_yaxes(tickformat=",.1f")
 
     elif mode == "pct":
@@ -869,10 +394,11 @@ def tab_market():
         plot_df_disp = plot_df_use.rename(columns=unique_map)
         ycols_disp = [unique_map.get(c, c) for c in ycols]
         fig = px.line(plot_df_disp, x="Date", y=ycols_disp, render_mode="svg")
-        fig.update_traces(connectgaps=True)
         fig.update_yaxes(ticksuffix="%", rangemode="tozero")
 
     elif mode == "pct_log":
+        # (1) 일반 변화율(%) → (2) 배수(= 1 + %/100)로 변환하여 로그축에 그리되,
+        #     눈금은 %처럼 보이도록 커스텀 라벨을 사용
         pct = rebase_pct(view, ycols).copy()
         for c in ycols:
             pct[c] = (pd.to_numeric(pct[c], errors="coerce") / 100.0) + 1.0  # 배수
@@ -880,12 +406,14 @@ def tab_market():
         plot_df_disp = pct.rename(columns=unique_map)
         ycols_disp = [unique_map.get(c, c) for c in ycols]
 
+        # 양수(로그 가능) 시리즈만 표시
         vals = plot_df_disp[ycols_disp].apply(pd.to_numeric, errors="coerce")
         y_show = [c for c in ycols_disp if (vals[c] > 0).any()]
         if not y_show:
             st.info("로그축에 표시할 수 있는 시리즈가 없습니다. 일반 변화율(%)로 확인해 주세요.")
             return
 
+        # 로그축 눈금: 배수값 → 라벨은 (배수-1)*100%
         y_min = float(vals[y_show].min().min())
         y_max = float(vals[y_show].max().max())
         tick_candidates = [0.25, 0.5, 1, 2, 3, 4, 5, 10, 20, 50, 100]
@@ -897,7 +425,6 @@ def tab_market():
         y_title = "누적 수익률 (%, 로그 간격)"
 
         fig = px.line(plot_df_disp, x="Date", y=y_show, render_mode="svg")
-        fig.update_traces(connectgaps=True)
         fig.update_layout(
             margin=dict(l=10, r=130, t=10, b=10),
             height=520,
@@ -908,6 +435,7 @@ def tab_market():
         )
         fig.update_yaxes(type="log", tickvals=tickvals, ticktext=ticktext)
 
+        # 마지막값 라벨(%) 표시
         last_idx = vals.dropna(how="all").index[-1]
         lx = plot_df_disp.loc[last_idx, "Date"]
         for c in y_show:
@@ -935,15 +463,16 @@ def tab_market():
             use_container_width=True,
             config={"scrollZoom": False, "doubleClick": "reset", "displaylogo": False},
         )
-        return
+        return  # ⬅️ 로그 모드에서는 여기서 종료
+
+
 
     else:  # mdd
-        plot_df_use = drawdown_pct(plot_df, ycols)
+        plot_df_use = drawdown_pct(plot_df, ycols)  
         y_title = "MDD (%, 낮을수록 심함)"
         plot_df_disp = plot_df_use.rename(columns=unique_map)
         ycols_disp = [unique_map.get(c, c) for c in ycols]
         fig = px.line(plot_df_disp, x="Date", y=ycols_disp, render_mode="svg")
-        fig.update_traces(connectgaps=True)
         fig.update_yaxes(ticksuffix="%", rangemode="tozero")
 
     # 공통 레이아웃 & 마커 라벨
@@ -1007,8 +536,7 @@ def tab_market():
     rows = []
     for c in ycols:
         s = price_df[c].dropna()
-        # ⬇️ 변경: pretty_label → pretty_label_with_fund (펀드명 20자 … 적용)
-        row = {"자산": pretty_label_with_fund(c)}
+        row = {"자산": pretty_label(c)}
         for name, d in windows:
             if not s.empty and len(s) > d:
                 val = s.pct_change(d).iloc[-1] * 100.0
@@ -1032,17 +560,8 @@ def tab_market():
     )
 
     # ---- (3) 단일 자산 이동평균 ----
-    # 표시 라벨은 펀드명(20자 …)으로, 내부 값은 코드 유지
-    options = [(pretty_label_with_fund(c), c) for c in ycols]  # (라벨, 코드)
-    sel_idx = st.selectbox(
-        "자산 선택",
-        options=list(range(len(options))),
-        format_func=lambda i: options[i][0],
-        index=0,
-        key="m_ma_one_idx"
-    )
-    one = options[sel_idx][1]                 # 내부적으로 사용할 '코드'
-    one_label = pretty_label_with_fund(one)   # 화면 표시용 라벨(펀드명 20자 …)
+    one = st.selectbox("자산 선택", options=ycols, index=0, key="m_ma_one")
+    one_label = pretty_label(one)
 
     one_df = view[["Date", one]].copy()
     one_df[one] = pd.to_numeric(one_df[one], errors="coerce")
@@ -1052,8 +571,7 @@ def tab_market():
     st.markdown("<h5>(3) Chart with Moving Averages</h5>", unsafe_allow_html=True)
     disp_ma = one_df.rename(columns={one: one_label})
     fig_ma = px.line(disp_ma, x="Date", y=one_label,
-                    title=f"{one_label} — Close & SMA(20/60/120)", render_mode="svg")
-    fig_ma.update_traces(connectgaps=False)
+                     title=f"{one_label} — Close & SMA(20/60/120)", render_mode="svg")
     for w in (20, 60, 120):
         col = f"SMA{w}"
         if col in disp_ma:
@@ -1062,7 +580,7 @@ def tab_market():
                 mode="lines", name=f"SMA{w}",
                 line=dict(dash="dot")))
     fig_ma.update_layout(height=600, margin=dict(l=10, r=130, t=30, b=10),
-                        uirevision="mkt_ma", xaxis_rangeslider_visible=False)
+                         uirevision="mkt_ma", xaxis_rangeslider_visible=False)
     st.plotly_chart(fig_ma, use_container_width=True)
 
     # ---- (4) Company Info (Finviz) ----
@@ -1112,13 +630,10 @@ def tab_market():
         key=xlsx_key,
     )
 
-# ==================== TAB 2: Portfolio (원본 유지 + 혼합소스 지원) ====================
+# ==================== TAB 2: Portfolio (원본 유지) ====================
 def guess_currency(ticker: str) -> str:
     t = ticker.upper()
-    if is_kofia_code(t):  # KOFIA는 기본 KRW로 가정
-        return "KRW"
-    if t.endswith(".KS") or t.endswith(".KQ"):
-        return "KRW"
+    if t.endswith(".KS") or t.endswith(".KQ"): return "KRW"
     return "USD"
 
 def rebalance_mask(dates: pd.DatetimeIndex, freq: str) -> pd.Series:
@@ -1182,7 +697,7 @@ def tab_portfolio():
 
     c1, c2, c3, c4 = st.columns([1.2, 1.1, 1, 1])
     with c1:
-        start = st.date_input("시작일", value=date(2025,1,1),
+        start = st.date_input("시작일", value=date(2020,1,1),
                               min_value=date(2000,1,1), max_value=date.today(), key="p_start")
     with c2:
         end = st.date_input("종료일", value=date.today(),
@@ -1225,7 +740,7 @@ def tab_portfolio():
             use_container_width=True,
             key="p_table",
             column_config={
-                "티커": st.column_config.TextColumn("티커 또는 펀드코드(KR..., 5~6자리 숫자)"),
+                "티커": st.column_config.TextColumn("티커"),
                 "P1(%)": st.column_config.NumberColumn(f"{name1}(%)", step=1.0, format="%.2f"),
                 "P2(%)": st.column_config.NumberColumn(f"{name2}(%)", step=1.0, format="%.2f"),
                 "P3(%)": st.column_config.NumberColumn(f"{name3}(%)", step=1.0, format="%.2f"),
@@ -1268,14 +783,14 @@ def tab_portfolio():
 
     tickers = tuple(sorted(set(list(w1.keys()) + list(w2.keys()) + list(w3.keys()))))
     with st.spinner(f"가격 불러오는 중... ({', '.join(tickers)})"):
-        raw_px = fetch_prices_mixed(tickers, start, end, use_adjust=True)
+        raw_px = fetch_yf_prices(tickers, start, end, use_adjust=True)
     if raw_px.empty: st.warning("가격 데이터를 가져오지 못했습니다."); st.stop()
 
     starts = {}
     for col in [c for c in raw_px.columns if c != "Date"]:
         s = raw_px[["Date", col]].dropna()
         starts[col] = s["Date"].min().date() if not s.empty else None
-    with st.expander("각 자산 데이터 시작일(상장/설정일 유사)"):
+    with st.expander("각 티커 데이터 시작일(상장일 유사)"):
         info_df = pd.DataFrame({"티커": list(starts.keys()),
                                 "데이터 시작일": [str(starts[k]) if starts[k] else "-" for k in starts]})
         st.table(info_df)
@@ -1297,22 +812,14 @@ def tab_portfolio():
     if usdkrw is not None:
         tmp = px_df.set_index("Date")
         for c in [c for c in tmp.columns if c != "Date"]:
-            is_kr = c.endswith(".KS") or c.endswith(".KQ") or is_kofia_code(c)
+            is_kr = c.endswith(".KS") or c.endswith(".KQ")
             if base_ccy == "KRW" and not is_kr:
-                tmp[c] = pd.to_numeric(tmp[c], errors="coerce") * usdkrw
+                tmp[c] = tmp[c] * usdkrw
             elif base_ccy == "USD" and is_kr:
                 tmp[c] = tmp[c] / usdkrw
         px_df = tmp.reset_index()
 
     prices = px_df.set_index("Date")
-    num_cols = [c for c in prices.columns if c != "Date"]
-    prices[num_cols] = prices[num_cols].apply(pd.to_numeric, errors="coerce")
-    first_valids = prices.apply(lambda s: s.first_valid_index())
-    common_start = first_valids.dropna().max()
-    if pd.notna(common_start):
-        prices = prices.loc[common_start:]
-
-
 
     rb_mode = st.session_state.get("p_rbmode", "없음(바이앤홀드)")
     mode = "BH" if rb_mode.startswith("없음") else "RB"
@@ -1457,7 +964,7 @@ def tab_portfolio():
         key=xlsx_key,
     )
 
-# ==================== TAB 3: Analysis (글로벌·펀드 혼합) ====================
+# ==================== TAB 3: Analysis (트렌드/모멘텀 제거) ====================
 def _coerce_date(s: pd.Series) -> pd.Series:
     if s.dtype.kind in "M":
         return pd.to_datetime(s).dt.tz_localize(None)
@@ -1497,7 +1004,7 @@ def fetch_yf_ohlcv(tickers: tuple, start, end, use_adjust=True) -> pd.DataFrame:
         def pick(k):
             return raw[k].copy() if k in lvl0 else pd.DataFrame(index=raw.index, columns=raw.columns.levels[1])
         close = pick("Close"); high = pick("High"); low = pick("Low"); vol = pick("Volume")
-        close.index.name = high.index.name = low.index.name = "Date"
+        close.index.name = high.index.name = low.index.name = vol.index.name = "Date"
 
         dfC = close.reset_index().melt(id_vars="Date", var_name="Ticker", value_name="Close")
         dfH = high.reset_index().melt(id_vars="Date", var_name="Ticker", value_name="High")
@@ -1574,116 +1081,30 @@ def compute_price_indicators(df_long: pd.DataFrame, ma_windows=(20,60,120), vol_
         )
     return {"data": data}
 
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_prices_mixed_long(tokens: tuple, start, end, use_adjust=True) -> pd.DataFrame:
-    """
-    야후 OHLCV(long) + KOFIA Close(long) 결합 → columns: Date, Ticker, Close, High, Low, Volume
-    KOFIA는 Close만 채워짐(High/Low/Volume은 NaN).
-    """
-    cols_out = ["Date", "Ticker", "Close", "High", "Low", "Volume"]
-    if not tokens:
-        return pd.DataFrame(columns=cols_out)
-
-    yf_list   = [t for t in tokens if not is_kofia_code(t)]
-    fund_list = [t for t in tokens if is_kofia_code(t)]
-
-    out_frames = []
-
-    # 1) Yahoo OHLCV (long)
-    if yf_list:
-        out_frames.append(fetch_yf_ohlcv(tuple(yf_list), start, end, use_adjust=use_adjust))
-
-    # 2) KOFIA NAV (Close만)
-    for code in fund_list:
-        try:
-            df = fetch_kofia_nav_xml(code, start, end)
-
-            # 비거나 Date 자체도 없으면 건너뜀
-            if df is None or df.empty or "Date" not in df.columns:
-                continue
-
-            # 가격 컬럼 결정: 보통 code, 없으면 Date 제외 첫 컬럼
-            price_col = code if code in df.columns else next(
-                (c for c in df.columns if c != "Date"), None
-            )
-            if not price_col:
-                st.info(f"KOFIA {code}: 가격 컬럼을 찾지 못해 건너뜀 (cols={list(df.columns)})")
-                continue
-
-            # 표준 컬럼 구성
-            tmp = df[["Date", price_col]].copy()
-            tmp = tmp.rename(columns={price_col: "Close"})
-            tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
-            tmp["Ticker"] = code
-            tmp["High"] = pd.NA
-            tmp["Low"] = pd.NA
-            tmp["Volume"] = pd.NA
-
-            out_frames.append(tmp[["Date", "Ticker", "Close", "High", "Low", "Volume"]])
-
-        except Exception as e:
-            st.warning(f"KOFIA 조회 실패({code}): {e}")
-
-
-    if not out_frames:
-        return pd.DataFrame(columns=cols_out)
-
-    out = pd.concat(out_frames, ignore_index=True, sort=False)
-    out = out[cols_out].copy()
-    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-
-    num_cols = [c for c in out.columns if c not in ("Date","Ticker")]
-    out[num_cols] = out[num_cols].apply(pd.to_numeric, errors="coerce")
-
-    return out.dropna(subset=["Date"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
 def tab_research_global():
     st.title("가격 리서치 (글로벌·펀드 포함)")
 
     c1, c2, c3 = st.columns([1.6, 1.0, 1.0])
     with c1:
-        raw = st.text_input("티커/펀드코드(쉼표/공백 구분) — 예: 005930.KS, 069500.KS, SPY, ^N225, KR5370199261, 19926",
+        raw = st.text_input("야후 티커(쉼표/공백 구분) — 예: 005930.KS, 069500.KS, SPY, ^N225, ^KS11",
                             value="069500.KS, SPY, ^KS11")
     with c2:
         start = st.date_input("시작일", value=date(2021,1,1), min_value=date(2000,1,1), max_value=date.today())
     with c3:
         end = st.date_input("종료일", value=date.today(), min_value=date(2000,1,1), max_value=date.today())
 
-    use_adj = st.checkbox("조정가격(배당/분할 반영) 사용(야후에만 해당)", value=True)
+    use_adj = st.checkbox("조정가격(배당/분할 반영) 사용", value=True)
     parsed = [t for t in re.split(r"[,\s]+", raw.upper()) if t.strip()]
 
     st.markdown("**펀드 NAV 파일 업로드(CSV/XLSX)** — 컬럼 예시: `일자, 기준가` 또는 `Date, Close`")
     fund_files = st.file_uploader("여러 개 업로드 가능", type=["csv","xls","xlsx"], accept_multiple_files=True)
 
     with st.spinner("데이터 불러오는 중..."):
-        yf_fd_long = fetch_prices_mixed_long(tuple(parsed), start, end, use_adjust=use_adj) if parsed else \
-                     pd.DataFrame(columns=["Date","Ticker","Close","High","Low","Volume"])
+        yf_long = fetch_yf_ohlcv(tuple(parsed), start, end, use_adjust=use_adj) if parsed else \
+                  pd.DataFrame(columns=["Date","Ticker","Close","High","Low","Volume"])
+        fd_long = pd.DataFrame(columns=["Date","Ticker","Close"])
 
-        # 업로드 파일은 Ticker를 파일명으로 부여
-        extra_frames = []
-        for f in fund_files or []:
-            try:
-                if f.name.lower().endswith(".csv"):
-                    df = pd.read_csv(f)
-                else:
-                    df = pd.read_excel(f)
-                # 유연한 컬럼명 처리
-                cols = {c.strip(): c for c in df.columns}
-                date_col = next((cols[c] for c in cols if c.lower() in ("date","일자","기준일","기준일자")), None)
-                close_col = next((cols[c] for c in cols if c.lower() in ("close","기준가","nav","가격")), None)
-                if date_col and close_col:
-                    tmp = df[[date_col, close_col]].copy()
-                tmp.columns = ["Date","Close"]
-                tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
-                tmp["Close"] = pd.to_numeric(tmp["Close"], errors="coerce")
-                tmp["Ticker"] = os.path.splitext(os.path.basename(f.name))[0].upper()
-                tmp["High"] = pd.NA; tmp["Low"] = pd.NA; tmp["Volume"] = pd.NA
-                extra_frames.append(tmp[["Date","Ticker","Close","High","Low","Volume"]])
-
-            except Exception as e:
-                st.warning(f"파일 파싱 실패({f.name}): {e}")
-
-    frames = [df for df in [yf_fd_long] + extra_frames if df is not None and not df.empty]
+    frames = [df for df in [yf_long, fd_long] if df is not None and not df.empty]
     base_long = (pd.concat(frames, ignore_index=True)
                  if frames else pd.DataFrame(columns=["Date","Ticker","Close","High","Low","Volume"]))
     if base_long.empty:
@@ -1832,9 +1253,11 @@ with tab3:  tab_research_global()
 # git commit -m "chore: update data and backup folders"
 # git push
 #   
+
 # git add requirements.txt
 # git commit -m "chore: update requirements.txt (add lxml)"
 
-# 실행 참고:   KR5370199261
+
+# 실행 참고:
 # cd C:\Users\woori\Desktop\top10
 # & "C:\Users\woori\anaconda3\python.exe" -m streamlit run ".\app.py"
