@@ -4,9 +4,9 @@ plotly
 yfinance
 xlsxwriter
 requests
-openpyxl
-xlrd
 numpy
-lxml
 beautifulsoup4
 html5lib
+openpyxl>=3.1.0
+xlrd>=2.0.1
+lxml>=4.9.0
