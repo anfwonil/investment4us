@@ -200,7 +200,7 @@ def pretty_label_with_fund(code_or_ticker: str) -> str:
 # ==== KOFIA(DIS) XML endpoint helpers ========================================
 KOFIA_URL = "https://dis.kofia.or.kr/proframeWeb/XMLSERVICES/"
 
-def _truncate_bytes(s: str, max_bytes: int = 20, encoding="utf-8") -> str:
+def _truncate_bytes(s: str, max_bytes: int = 15, encoding="utf-8") -> str:
     b = s.encode(encoding)[:max_bytes]
     while True:
         try:
@@ -461,6 +461,9 @@ def fetch_prices_mixed(tickers: tuple, start, end, use_adjust=True) -> pd.DataFr
     for f in frames[1:]:
         if "Date" not in f.columns:
             continue
+        # 🔧 충돌 방지: fundNm 같은 메타컬럼은 제거
+        f = f.drop(columns=[c for c in f.columns if c.lower().startswith("fundnm")], errors="ignore")
+        out = out.drop(columns=[c for c in out.columns if c.lower().startswith("fundnm")], errors="ignore")
         out = pd.merge(out, f, on="Date", how="outer")
 
     return out.sort_values("Date").reset_index(drop=True)
@@ -691,7 +694,7 @@ def tab_market():
     base = load_base_data(DATA_CSV)
     last_updated = load_meta(META_CSV)
 
-    st.title("MARKET PERFORMANCE")
+    st.title("Market Performance")
     if last_updated:
         st.caption(f"마지막 업데이트(KST): {last_updated} developed by W.I Lee")
 
@@ -800,10 +803,13 @@ def tab_market():
     if new_only:
         with st.spinner(f"가격 불러오는 중... ({', '.join(new_only)})"):
             fetched_now = fetch_prices_mixed(tuple(new_only), start, end, use_adjust=use_adj)
+
         if not fetched_now.empty:
-            # ⚠️ fundNm 컬럼 충돌 방지
-            if "fundNm" in fetched_now.columns:
-                fetched_now = fetched_now.drop(columns=["fundNm"])
+            drop_cols = [c for c in fetched_now.columns if c.lower().startswith("fundnm")]
+            fetched_now = fetched_now.drop(columns=drop_cols, errors="ignore")
+
+            drop_cols2 = [c for c in view.columns if c.lower().startswith("fundnm")]
+            view = view.drop(columns=drop_cols2, errors="ignore")
 
             view = pd.merge(view, fetched_now, on="Date", how="outer").sort_values("Date")
             st.session_state["m_extra"] = sorted(set(st.session_state["m_extra"]) | set(new_only))
@@ -981,18 +987,18 @@ def tab_market():
                 idx_max = sc[c].idxmax(); x_max = sc.loc[idx_max, "Date"]; y_max = sc.loc[idx_max, c]
                 idx_min = sc[c].idxmin(); x_min = sc.loc[idx_min, "Date"]; y_min = sc.loc[idx_min, c]
                 fig.add_trace(go.Scatter(x=[x_max], y=[y_max], mode="markers+text",
-                                         text=[format_tail_value(y_max, mode)], textposition="top right",
-                                         marker=dict(size=8), showlegend=False, hoverinfo="skip", legendgroup=c))
+                                         text=[format_tail_value(y_max, mode)], textposition="top right", textfont=dict(color="blue"),
+                                         marker=dict(size=4), showlegend=False, hoverinfo="skip", legendgroup=c))
                 if idx_min != idx_max:
                     fig.add_trace(go.Scatter(x=[x_min], y=[y_min], mode="markers+text",
-                                             text=[format_tail_value(y_min, mode)], textposition="bottom right",
-                                             marker=dict(size=8), showlegend=False, hoverinfo="skip", legendgroup=c))
+                                             text=[format_tail_value(y_min, mode)], textposition="bottom right", textfont=dict(color="red"),
+                                             marker=dict(size=4, color="blue"), showlegend=False, hoverinfo="skip", legendgroup=c))
                 is_last_extreme = (x_max == lx) or (x_min == lx)
                 if not is_last_extreme:
                     v_last = sc.iloc[-1][c]
                     fig.add_trace(go.Scatter(x=[lx], y=[v_last], mode="markers+text",
-                                             text=[format_tail_value(v_last, mode)], textposition="middle right",
-                                             marker=dict(size=6), showlegend=False, hoverinfo="skip", legendgroup=c))
+                                             text=[format_tail_value(v_last, mode)], textposition="middle right", textfont=dict(color="black"),
+                                             marker=dict(size=4, color="black"), showlegend=False, hoverinfo="skip", legendgroup=c))
 
     st.plotly_chart(fig, use_container_width=True,
                     config={"scrollZoom": False, "doubleClick": "reset", "displaylogo": False})
@@ -1178,7 +1184,7 @@ def portfolio_metrics(equity: pd.Series) -> dict:
     return {"CAGR": cagr, "Vol": vol, "Sharpe": sharpe, "MDD": mdd, "Calmar": calmar}
 
 def tab_portfolio():
-    st.title("PORTFOLIO ANALYSIS")
+    st.title("Portfolio Analysis")
 
     c1, c2, c3, c4 = st.columns([1.2, 1.1, 1, 1])
     with c1:
@@ -1205,12 +1211,13 @@ def tab_portfolio():
 
     lite = st.checkbox("경량 모드(주간 리샘플)", value=False, help="브라우저가 느리면 켜 보세요.", key="p_lite")
 
-    default_df = pd.DataFrame([
-        {"티커":"SPY", "P1(%)":40.0, "P2(%)":33.0, "P3(%)":40.0},
-        {"티커":"QQQ", "P1(%)":40.0, "P2(%)":33.0, "P3(%)":40.0},
-        {"티커":"TLT", "P1(%)":20.0, "P2(%)":34.0, "P3(%)":20.0},
-    ])
-    st.session_state.setdefault("weights_df", default_df.copy())
+    # 최초 1회만 기본값 세팅
+    if "weights_df" not in st.session_state:
+        st.session_state["weights_df"] = pd.DataFrame([
+            {"티커":"SPY", "P1(%)":40.0, "P2(%)":33.0, "P3(%)":40.0},
+            {"티커":"QQQ", "P1(%)":40.0, "P2(%)":33.0, "P3(%)":40.0},
+            {"티커":"TLT", "P1(%)":20.0, "P2(%)":34.0, "P3(%)":20.0},
+        ])
 
     with st.form("weights_form", clear_on_submit=False):
         h1, h2 = st.columns([1.0, 0.14])
@@ -1219,22 +1226,26 @@ def tab_portfolio():
         with h2:
             apply_weights = st.form_submit_button("반영", use_container_width=True)
 
+        # ⚠️ 여기서는 컬럼 라벨 고정 (절대 name1 같은 변수 쓰지 말기)
         edited = st.data_editor(
             st.session_state["weights_df"],
             num_rows="dynamic",
             use_container_width=True,
-            key="p_table",
+            key="p_table_fixed",
             column_config={
                 "티커": st.column_config.TextColumn("티커 또는 펀드코드(KR..., 5~6자리 숫자)"),
-                "P1(%)": st.column_config.NumberColumn(f"{name1}(%)", step=1.0, format="%.2f"),
-                "P2(%)": st.column_config.NumberColumn(f"{name2}(%)", step=1.0, format="%.2f"),
-                "P3(%)": st.column_config.NumberColumn(f"{name3}(%)", step=1.0, format="%.2f"),
+                "P1(%)": st.column_config.NumberColumn("포트폴리오1 (%)", step=1.0, format="%.2f"),
+                "P2(%)": st.column_config.NumberColumn("포트폴리오2 (%)", step=1.0, format="%.2f"),
+                "P3(%)": st.column_config.NumberColumn("포트폴리오3 (%)", step=1.0, format="%.2f"),
             },
         )
 
-    if "apply_weights" in locals() and apply_weights:
+    if apply_weights:
         st.session_state["weights_df"] = edited.copy()
         st.success("가중치를 반영했습니다.")
+
+    # 이후 출력/그래프에서만 이름 반영
+    st.write(f"📊 현재 포트폴리오 이름: {name1}, {name2}, {name3}")
 
     edit_df = st.session_state["weights_df"].copy()
 
@@ -1831,7 +1842,14 @@ with tab3:  tab_research_global()
 # git add -A
 # git commit -m "chore: update data and backup folders"
 # git push
+
 #   
+# git commit -m "update: latest changes from run_update"
+# git push origin main
+   
+
+
+
 # git add requirements.txt
 # git commit -m "chore: update requirements.txt (add lxml)"
 
