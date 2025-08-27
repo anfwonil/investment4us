@@ -477,7 +477,7 @@ COMMON_ALIASES = {
     "eurostoxx50": "^STOXX50E", "euro stoxx 50": "^STOXX50E",
     "ftse100": "^FTSE", "hang seng": "^HSI", "dax": "^GDAXI", "cac40": "^FCHI",
     "dollar index": "DX-Y.NYB", "us dollar index": "DX-Y.NYB",
-    "usdkrw": "KRW=X", "usdcny": "CNY=X",
+    "usdkrw": "USDKRW=X", "usdcny": "CNY=X",
 }
 
 # -------------------- Finviz 크롤러 --------------------
@@ -1037,8 +1037,9 @@ def tab_market():
         }
     )
 
-    # ---- (3) 단일 자산 이동평균 ----
-    # 표시 라벨은 펀드명(20자 …)으로, 내부 값은 코드 유지
+    # ---- (3) 단일 자산 이동평균 + 캔들/거래량/RSI ----
+    st.markdown("<h5>(3) Chart with Candlestick, SMA, Volume & RSI</h5>", unsafe_allow_html=True)
+
     options = [(pretty_label_with_fund(c), c) for c in ycols]  # (라벨, 코드)
     sel_idx = st.selectbox(
         "자산 선택",
@@ -1047,29 +1048,115 @@ def tab_market():
         index=0,
         key="m_ma_one_idx"
     )
-    one = options[sel_idx][1]                 # 내부적으로 사용할 '코드'
-    one_label = pretty_label_with_fund(one)   # 화면 표시용 라벨(펀드명 20자 …)
+    one = options[sel_idx][1]                 # 내부 코드
+    one_label = pretty_label_with_fund(one)   # 라벨
 
-    one_df = view[["Date", one]].copy()
-    one_df[one] = pd.to_numeric(one_df[one], errors="coerce")
-    for w in (20, 60, 120):
-        one_df[f"SMA{w}"] = one_df[one].rolling(w).mean()
+    # ✅ 별칭 적용
+    one_norm = COMMON_ALIASES.get(one.lower(), one)
 
-    st.markdown("<h5>(3) Chart with Moving Averages</h5>", unsafe_allow_html=True)
-    disp_ma = one_df.rename(columns={one: one_label})
-    fig_ma = px.line(disp_ma, x="Date", y=one_label,
-                    title=f"{one_label} — Close & SMA(20/60/120)", render_mode="svg")
-    fig_ma.update_traces(connectgaps=False)
-    for w in (20, 60, 120):
-        col = f"SMA{w}"
-        if col in disp_ma:
-            fig_ma.add_trace(go.Scatter(
-                x=disp_ma["Date"], y=disp_ma[col],
-                mode="lines", name=f"SMA{w}",
-                line=dict(dash="dot")))
-    fig_ma.update_layout(height=600, margin=dict(l=10, r=130, t=30, b=10),
-                        uirevision="mkt_ma", xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig_ma, use_container_width=True)
+    # ✅ 데이터 가져오기 (야후 vs KOFIA)
+    if is_kofia_code(one_norm):
+        df_nav = fetch_kofia_nav_xml(one_norm, start, end)
+        if df_nav.empty:
+            st.warning("해당 펀드의 NAV 데이터를 불러올 수 없습니다.")
+            return
+        df = pd.DataFrame({
+            "Date": df_nav["Date"],
+            "Close": pd.to_numeric(df_nav[one_norm], errors="coerce")
+        })
+        df["Ticker"] = one_norm
+        # High/Low/Volume 없음
+    else:
+        ohlcv = fetch_yf_ohlcv((one_norm,), start, end, use_adjust=True)
+        if ohlcv.empty:
+            st.warning("해당 자산의 OHLCV 데이터를 불러올 수 없습니다.")
+            return
+        df = ohlcv.copy()
+
+
+        # 이동평균
+        for w in (20, 60, 120):
+            if "Close" in df.columns:
+                df[f"SMA{w}"] = df["Close"].rolling(w).mean()
+
+        # RSI 계산
+        def calc_RSI(series, period=14):
+            delta = series.diff()
+            up = delta.clip(lower=0)
+            down = -1 * delta.clip(upper=0)
+            roll_up = up.ewm(span=period, adjust=False).mean()
+            roll_down = down.ewm(span=period, adjust=False).mean()
+            RS = roll_up / roll_down
+            RSI = 100 - (100 / (1 + RS))
+            return RSI
+        df["RSI14"] = calc_RSI(df["Close"], 14)
+
+        fig = go.Figure()
+
+        if {"Open","High","Low","Close"}.issubset(df.columns):
+            # 캔들 가능
+            fig.add_trace(go.Candlestick(
+                x=df["Date"],
+                open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+                increasing_line_color="red", decreasing_line_color="blue",
+                name=one_label
+            ))
+            if "Volume" in df.columns:
+                fig.add_trace(go.Bar(
+                    x=df["Date"], y=df["Volume"],
+                    name="Volume", yaxis="y2", opacity=0.4
+                ))
+            price_domain = [0.45,1.0]; vol_domain=[0.25,0.4]
+        else:
+            # 선차트 (Close만 있는 경우)
+            fig.add_trace(go.Scatter(
+                x=df["Date"], y=df["Close"],
+                mode="lines", name=f"{one_label} (Close)"
+            ))
+            price_domain = [0.3,1.0]; vol_domain=None
+
+
+        # 이동평균선
+        for w in (20, 60, 120):
+            fig.add_trace(go.Scatter(
+                x=df["Date"], y=df[f"SMA{w}"],
+                mode="lines", name=f"SMA{w}", line=dict(dash="dot")
+            ))
+
+        # RSI
+        fig.add_trace(go.Scatter(
+            x=df["Date"], y=df["RSI14"],
+            mode="lines", name="RSI(14)",
+            line=dict(color="purple", width=1.2),
+            yaxis="y3"
+        ))
+
+        # RSI 기준선
+        for lvl, clr in [(30, "blue"), (70, "red")]:
+            fig.add_trace(go.Scatter(
+                x=df["Date"], y=[lvl]*len(df),
+                mode="lines", name=f"RSI {lvl}",
+                line=dict(color=clr, dash="dash", width=1),
+                yaxis="y3"
+            ))
+
+        # 레이아웃
+        layout_args = dict(
+            title=f"{one_label} — Chart with SMA, Volume & RSI",
+            xaxis=dict(rangeslider=dict(visible=False)),
+            yaxis=dict(title="Price", domain=price_domain),
+            yaxis3=dict(title="RSI", domain=[0.0, 0.2], range=[0,100], showgrid=True),
+            height=850,
+            margin=dict(l=10, r=120, t=30, b=20),
+            legend=dict(orientation="v", yanchor="top", y=0.99, xanchor="left", x=1.02)
+        )
+        if vol_domain:
+            layout_args["yaxis2"] = dict(title="Volume", domain=vol_domain, showgrid=False)
+
+        fig.update_layout(**layout_args)
+
+        st.plotly_chart(fig, use_container_width=True)
+
 
     # ---- (4) Company Info (Finviz) ----
     st.markdown("<h5>(4) Company Info</h5>", unsafe_allow_html=True)
@@ -1487,7 +1574,7 @@ def _to_number(x: pd.Series) -> pd.Series:
 
 @st.cache_data(ttl=1200, show_spinner=False)
 def fetch_yf_ohlcv(tickers: tuple, start, end, use_adjust=True) -> pd.DataFrame:
-    cols_out = ["Date","Ticker","Close","High","Low","Volume"]
+    cols_out = ["Date","Ticker","Open","High","Low","Close","Volume"]
     if not tickers:
         return pd.DataFrame(columns=cols_out)
 
@@ -1504,35 +1591,45 @@ def fetch_yf_ohlcv(tickers: tuple, start, end, use_adjust=True) -> pd.DataFrame:
         return pd.DataFrame(columns=cols_out)
 
     if isinstance(raw.columns, pd.MultiIndex):
-        lvl0 = list(raw.columns.levels[0])
-        def pick(k):
-            return raw[k].copy() if k in lvl0 else pd.DataFrame(index=raw.index, columns=raw.columns.levels[1])
-        close = pick("Close"); high = pick("High"); low = pick("Low"); vol = pick("Volume")
-        close.index.name = high.index.name = low.index.name = "Date"
+        def pick(k): 
+            return raw[k] if k in raw.columns.levels[0] else pd.DataFrame(index=raw.index)
+        open_ = pick("Open"); high = pick("High"); low = pick("Low")
+        close = pick("Close"); vol = pick("Volume")
+        open_.index.name = close.index.name = "Date"
 
+        dfO = open_.reset_index().melt(id_vars="Date", var_name="Ticker", value_name="Open")
         dfC = close.reset_index().melt(id_vars="Date", var_name="Ticker", value_name="Close")
         dfH = high.reset_index().melt(id_vars="Date", var_name="Ticker", value_name="High")
         dfL = low.reset_index().melt(id_vars="Date", var_name="Ticker", value_name="Low")
         dfV = vol.reset_index().melt(id_vars="Date", var_name="Ticker", value_name="Volume")
-        out = dfC.merge(dfH, on=["Date","Ticker"], how="left")\
+
+        out = dfO.merge(dfC, on=["Date","Ticker"], how="left")\
+                 .merge(dfH, on=["Date","Ticker"], how="left")\
                  .merge(dfL, on=["Date","Ticker"], how="left")\
                  .merge(dfV, on=["Date","Ticker"], how="left")
     else:
-        cols = raw.columns.tolist()
-        def getc(k): return raw[k] if k in cols else pd.Series(index=raw.index, dtype=float)
         tkr = list(tickers)[0]
+        # ✅ 환율/지수 (Close만 있는 경우 보정)
+        if "Close" in raw.columns and "Open" not in raw.columns:
+            out = pd.DataFrame({
+                "Date": raw.index,
+                "Ticker": tkr,
+                "Close": raw["Close"]
+            }).reset_index(drop=True)
+            return out   # 🔑 여기서 함수 끝냄
+
+        # ✅ 일반 주식/ETF (OHLCV 모두 있음)
         out = pd.DataFrame({
             "Date": raw.index,
             "Ticker": tkr,
-            "Close": _to_number(getc("Close")),
-            "High":  _to_number(getc("High")),
-            "Low":   _to_number(getc("Low")),
-            "Volume":_to_number(getc("Volume")),
+            "Open": raw.get("Open"),
+            "High": raw.get("High"),
+            "Low":  raw.get("Low"),
+            "Close":raw.get("Close"),
+            "Volume": raw.get("Volume"),
         })
-
-    out["Date"] = _coerce_date(out["Date"])
-    out = out.sort_values(["Ticker","Date"]).reset_index(drop=True)
-    return out
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    return out.dropna(subset=["Date"]).sort_values(["Ticker","Date"]).reset_index(drop=True)
 
 def build_pair_series(df_long: pd.DataFrame, t1: str, t2: str):
     p = df_long.pivot(index="Date", columns="Ticker", values="Close")
