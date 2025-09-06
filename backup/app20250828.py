@@ -15,6 +15,58 @@ import yfinance as yf
 import requests
 from io import StringIO
 
+# -------------------- 네이버 종목/ETF 크롤러 --------------------
+def is_etf_code(ticker: str) -> bool:
+    """국내 .KS/.KQ 티커가 ETF인지 판별"""
+    code = ticker.split(".")[0]
+    url = f"https://finance.naver.com/item/coinfo.naver?code={code}&target=etfinfo_more"
+    try:
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=5)
+        return r.ok and "ETF" in r.text.upper()
+    except Exception:
+        return False
+
+def fetch_naver_etf(ticker: str):
+    """네이버 ETF 구성종목 + 거래량/거래대금 + 설명"""
+    code = ticker.split(".")[0]
+    url = f"https://finance.naver.com/item/coinfo.naver?code={code}&target=etfinfo_more"
+    r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+    if not r.ok:
+        return f"네이버 ETF 페이지 로딩 실패({ticker})", pd.DataFrame()
+
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(r.text, "html.parser")
+    desc_node = soup.select_one(".summary_info") or soup.select_one(".description")
+    desc = desc_node.get_text(" ", strip=True) if desc_node else "ETF 설명을 찾을 수 없습니다."
+
+    tables = pd.read_html(StringIO(r.text))
+    comp_df, vol_df = pd.DataFrame(), pd.DataFrame()
+    for df in tables:
+        if "구성종목명" in df.columns.tolist():
+            comp_df = df
+        elif "거래량" in df.columns.tolist():
+            vol_df = df
+    return desc, pd.concat([comp_df, vol_df], axis=1, ignore_index=False)
+
+def fetch_naver_company(ticker: str):
+    """네이버 종목 분석 (재무제표 + 설명)"""
+    code = ticker.split(".")[0]
+    url = f"https://finance.naver.com/item/coinfo.naver?code={code}"
+    r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+    if not r.ok:
+        return f"네이버 종목 페이지 로딩 실패({ticker})", pd.DataFrame()
+
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(r.text, "html.parser")
+    desc_node = soup.select_one(".summary_info") or soup.select_one(".description")
+    desc = desc_node.get_text(" ", strip=True) if desc_node else "회사 설명을 찾을 수 없습니다."
+
+    tables = pd.read_html(StringIO(r.text))
+    fin_df = pd.DataFrame()
+    for df in tables:
+        if "매출액" in df.iloc[:,0].tolist():
+            fin_df = df; break
+    return desc, fin_df
 
 st.set_page_config(page_title="Market Performance", layout="wide")
 
@@ -178,15 +230,14 @@ def pretty_label_with_fund(code_or_ticker: str) -> str:
     """
     그래프 라벨에 사용할 표시명:
     - FUND_MAP에 있으면 펀드명(20자)
-    - 없으면 기존 pretty_label(code_or_ticker) 결과 사용
+    - 없으면 pretty_label(code_or_ticker) 결과 사용
     """
     c = str(code_or_ticker).upper()
-    hit = FUND_MAP.loc[FUND_MAP["code"]==c]
+    hit = FUND_MAP.loc[FUND_MAP["code"] == c]
     if not hit.empty:
         return hit.iloc[0]["name20"]
-    # (기존 pretty_label 이 이미 있다면 그걸 호출하세요)
     try:
-        return pretty_label(c)  # 당신의 기존 함수
+        return pretty_label(c)
     except Exception:
         return c
     
@@ -197,17 +248,6 @@ def pretty_label_with_fund(code_or_ticker: str) -> str:
             if not hit.empty:
                 return hit.iloc[0]["name20"]  # 20자 절단 펀드명
         return pretty_label(s)
-
-def _is_krx_symbol(s: str) -> bool:
-    """6자리(선택적으로 .KS/.KQ) 한국거래소 심볼 판별"""
-    s = str(s).strip().upper()
-    return bool(re.fullmatch(r"\d{6}(\.K[QS])?", s))
-
-def _to_krx_code(s: str) -> str | None:
-    """'005930' 또는 '005930.KS' → '005930'로 표준화, 아니면 None"""
-    m = re.fullmatch(r"(\d{6})(?:\.K[QS])?$", str(s).strip().upper())
-    return m.group(1) if m else None
-
 
 # ==== KOFIA(DIS) XML endpoint helpers ========================================
 KOFIA_URL = "https://dis.kofia.or.kr/proframeWeb/XMLSERVICES/"
@@ -572,68 +612,6 @@ def fetch_finviz_company(ticker: str):
     except Exception as e:
         return f"Finviz 로딩 실패: {e}", pd.DataFrame(
             [{"Indicator 1":"Error","Value 1":str(e),"Indicator 2":"Ticker","Value 2":t}]
-        )
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_naver_overview(sym: str):
-    """
-    네이버 금융에서 국내 종목 개요 + 주요지표 테이블을 긁어와
-    (profile_text, df_wide) 형태로 반환합니다.
-    df_wide 컬럼: ["Indicator 1","Value 1","Indicator 2","Value 2"]
-    """
-    from bs4 import BeautifulSoup
-
-    code6 = _to_krx_code(sym)
-    if not code6:
-        return "국내 종목 코드를 인식하지 못했습니다.", pd.DataFrame(
-            columns=["Indicator 1","Value 1","Indicator 2","Value 2"]
-        )
-
-    url = f"https://finance.naver.com/item/main.nhn?code={code6}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    try:
-        r = requests.get(url, headers=headers, timeout=10)
-        # 네이버는 EUC-KR일 수 있으니 인코딩 지정
-        r.encoding = r.apparent_encoding or "euc-kr"
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        # 이름/간단 설명
-        nm_node = soup.select_one("div.wrap_company h2 a") or soup.select_one("div.wrap_company h2")
-        name = nm_node.get_text(" ", strip=True) if nm_node else code6
-        corp_info = soup.select_one("div.corp_info")
-        desc = corp_info.get_text(" ", strip=True) if corp_info else ""
-        profile_text = f"**{name}** — {desc or '네이버 금융 개요'}"
-
-        # 테이블 → (지표, 값) 쌍 수집
-        pairs = []
-        for tr in soup.select("table tr"):
-            ths = [th.get_text(" ", strip=True) for th in tr.select("th")]
-            tds = [td.get_text(" ", strip=True) for td in tr.select("td")]
-            for k in range(min(len(ths), len(tds))):
-                lab, val = ths[k], tds[k]
-                if lab and val and len(lab) <= 30:
-                    pairs.append((lab, val))
-
-        # 중복 라벨 제거하고 2열 표로 재구성
-        uniq, seen = [], set()
-        for lab, val in pairs:
-            if lab in seen:
-                continue
-            seen.add(lab); uniq.append((lab, val))
-
-        rows = []
-        for i in range(0, len(uniq), 2):
-            c1, v1 = uniq[i]
-            c2, v2 = uniq[i+1] if i+1 < len(uniq) else ("", "")
-            rows.append([c1, v1, c2, v2])
-
-        df_wide = pd.DataFrame(rows, columns=["Indicator 1","Value 1","Indicator 2","Value 2"])
-        return profile_text, df_wide
-
-    except Exception as e:
-        return f"네이버 페이지 로딩 실패: {e}", pd.DataFrame(
-            columns=["Indicator 1","Value 1","Indicator 2","Value 2"]
         )
 
 # -------------------- 야후 검색 --------------------
@@ -1111,7 +1089,7 @@ def tab_market():
         }
     )
 
-    # ---- (3) 단일 자산 이동평균 + 캔들/거래량/RSI ----
+    # ---- (3) Chart with Candlestick, SMA, Volume & RSI ----
     st.markdown("<h5>(3) Chart with Candlestick, SMA, Volume & RSI</h5>", unsafe_allow_html=True)
 
     options = [(pretty_label_with_fund(c), c) for c in ycols]  # (라벨, 코드)
@@ -1125,132 +1103,204 @@ def tab_market():
     one = options[sel_idx][1]                 # 내부 코드
     one_label = pretty_label_with_fund(one)   # 라벨
 
-    # ✅ 별칭 적용
-    one_norm = COMMON_ALIASES.get(one.lower(), one)
+    # ✅ 별칭 적용 + 대문자 통일
+    one_norm = COMMON_ALIASES.get(one.lower(), one).upper()
 
-    # ✅ 데이터 가져오기 (야후 vs KOFIA)
+    # --- 데이터 로드 (Yahoo or KOFIA) ---
     if is_kofia_code(one_norm):
         df_nav = fetch_kofia_nav_xml(one_norm, start, end)
         if df_nav.empty:
             st.warning("해당 펀드의 NAV 데이터를 불러올 수 없습니다.")
-            return
+            st.stop()
         df = pd.DataFrame({
             "Date": df_nav["Date"],
             "Close": pd.to_numeric(df_nav[one_norm], errors="coerce")
         })
         df["Ticker"] = one_norm
-        # High/Low/Volume 없음
+        have_ohlc = False
+        have_vol = False
     else:
         ohlcv = fetch_yf_ohlcv((one_norm,), start, end, use_adjust=True)
         if ohlcv.empty:
             st.warning("해당 자산의 OHLCV 데이터를 불러올 수 없습니다.")
-            return
+            st.stop()
         df = ohlcv.copy()
+        have_ohlc = {"Open","High","Low","Close"}.issubset(df.columns)
+        have_vol = "Volume" in df.columns and df["Volume"].notna().any()
 
-
-        # 이동평균
+    # --- 공통: SMA/RSI 계산 ---
+    if "Close" in df.columns:
         for w in (20, 60, 120):
-            if "Close" in df.columns:
-                df[f"SMA{w}"] = df["Close"].rolling(w).mean()
+            df[f"SMA{w}"] = df["Close"].rolling(w).mean()
 
-        # RSI 계산
         def calc_RSI(series, period=14):
             delta = series.diff()
             up = delta.clip(lower=0)
-            down = -1 * delta.clip(upper=0)
+            down = -delta.clip(upper=0)
             roll_up = up.ewm(span=period, adjust=False).mean()
             roll_down = down.ewm(span=period, adjust=False).mean()
-            RS = roll_up / roll_down
-            RSI = 100 - (100 / (1 + RS))
-            return RSI
+            RS = roll_up / (roll_down.replace(0, pd.NA))
+            return 100 - (100 / (1 + RS))
+
         df["RSI14"] = calc_RSI(df["Close"], 14)
 
-        fig = go.Figure()
+    # --- 그리기 ---
+    fig = go.Figure()
 
-        if {"Open","High","Low","Close"}.issubset(df.columns):
-            # 캔들 가능
-            fig.add_trace(go.Candlestick(
-                x=df["Date"],
-                open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-                increasing_line_color="red", decreasing_line_color="blue",
-                name=one_label
+    if have_ohlc:
+        # 캔들스틱
+        fig.add_trace(go.Candlestick(
+            x=df["Date"],
+            open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+            increasing_line_color="red", decreasing_line_color="blue",
+            name=one_label
+        ))
+        price_domain = [0.45, 1.0] if have_vol else [0.3, 1.0]
+        if have_vol:
+            fig.add_trace(go.Bar(
+                x=df["Date"], y=df["Volume"],
+                name="Volume", yaxis="y2", opacity=0.4
             ))
-            if "Volume" in df.columns:
-                fig.add_trace(go.Bar(
-                    x=df["Date"], y=df["Volume"],
-                    name="Volume", yaxis="y2", opacity=0.4
-                ))
-            price_domain = [0.45,1.0]; vol_domain=[0.25,0.4]
-        else:
-            # 선차트 (Close만 있는 경우)
-            fig.add_trace(go.Scatter(
-                x=df["Date"], y=df["Close"],
-                mode="lines", name=f"{one_label} (Close)"
-            ))
-            price_domain = [0.3,1.0]; vol_domain=None
+    else:
+        # Close만 있는 경우(펀드/환율/일부지수 등): 선차트
+        fig.add_trace(go.Scatter(
+            x=df["Date"], y=df["Close"],
+            mode="lines", name=f"{one_label} (Close)"
+        ))
+        price_domain = [0.3, 1.0]
 
-
-        # 이동평균선
-        for w in (20, 60, 120):
+    # 이동평균선
+    for w in (20, 60, 120):
+        col = f"SMA{w}"
+        if col in df.columns:
             fig.add_trace(go.Scatter(
-                x=df["Date"], y=df[f"SMA{w}"],
+                x=df["Date"], y=df[col],
                 mode="lines", name=f"SMA{w}", line=dict(dash="dot")
             ))
 
-        # RSI
+    # RSI
+    if "RSI14" in df.columns and df["RSI14"].notna().any():
         fig.add_trace(go.Scatter(
             x=df["Date"], y=df["RSI14"],
             mode="lines", name="RSI(14)",
-            line=dict(color="purple", width=1.2),
+            line=dict(width=1.2),
             yaxis="y3"
         ))
-
         # RSI 기준선
-        for lvl, clr in [(30, "blue"), (70, "red")]:
+        for lvl in (30, 70):
             fig.add_trace(go.Scatter(
                 x=df["Date"], y=[lvl]*len(df),
                 mode="lines", name=f"RSI {lvl}",
-                line=dict(color=clr, dash="dash", width=1),
-                yaxis="y3"
+                line=dict(dash="dash", width=1),
+                yaxis="y3", showlegend=False
             ))
 
-        # 레이아웃
-        layout_args = dict(
-            title=f"{one_label} — Chart with SMA, Volume & RSI",
-            xaxis=dict(rangeslider=dict(visible=False)),
-            yaxis=dict(title="Price", domain=price_domain),
-            yaxis3=dict(title="RSI", domain=[0.0, 0.2], range=[0,100], showgrid=True),
-            height=850,
-            margin=dict(l=10, r=120, t=30, b=20),
-            legend=dict(orientation="v", yanchor="top", y=0.99, xanchor="left", x=1.02)
-        )
-        if vol_domain:
-            layout_args["yaxis2"] = dict(title="Volume", domain=vol_domain, showgrid=False)
+    # 레이아웃
+    layout_args = dict(
+        title=f"{one_label} — Chart with SMA, Volume & RSI",
+        xaxis=dict(rangeslider=dict(visible=False)),
+        yaxis=dict(title="Price", domain=price_domain),
+        yaxis3=dict(title="RSI", domain=[0.0, 0.2], range=[0,100], showgrid=True),
+        height=850,
+        margin=dict(l=10, r=120, t=30, b=20),
+        legend=dict(orientation="v", yanchor="top", y=0.99, xanchor="left", x=1.02)
+    )
+    if have_vol:
+        layout_args["yaxis2"] = dict(title="Volume", domain=[0.25, 0.4], showgrid=False)
 
-        fig.update_layout(**layout_args)
+    fig.update_layout(**layout_args)
+    st.plotly_chart(fig, use_container_width=True)
 
-        st.plotly_chart(fig, use_container_width=True)
 
+
+# --- KRX/ETF 판별 & 정보용 심볼 해석 -----------------------------------------
+import re
+
+def _is_krx_symbol(s: str) -> bool:
+    """6자리(선택적으로 .KS/.KQ)면 True"""
+    return bool(re.fullmatch(r"\d{6}(\.K[QS])?", str(s).strip().upper()))
+
+def is_etf_yahoo(sym: str) -> bool:
+    """Yahoo 정보로 ETF 여부 판별(가급적 신뢰)"""
+    try:
+        qt = (yf.Ticker(sym).info or {}).get("quoteType", "").upper()
+        return "ETF" in qt
+    except Exception:
+        return False
+
+def resolve_info_symbol(user_sym: str) -> tuple[str, str]:
+    """
+    입력(라벨/별칭/숫자/티커)을 → (kind, symbol) 로 변환
+    kind: 'krx' | 'kofia' | 'global' | ''
+    """
+    s = (user_sym or "").strip().upper()
+    if not s:
+        return ("", "")
+
+    # KOFIA 코드 우선
+    if is_kofia_code(s):
+        return ("kofia", s)
+
+    # KRX 패턴(6자리 or .KS/.KQ)
+    if is_krx_like(s) or s.endswith((".KS", ".KQ")):
+        return ("krx", s)
+
+    # 별칭 우선 변환
+    if s.lower() in COMMON_ALIASES:
+        cand = COMMON_ALIASES[s.lower()].upper()
+        if cand.endswith((".KS", ".KQ")) or is_krx_like(cand):
+            return ("krx", cand)
+        return ("global", cand)
+
+    # 야후 검색으로 KRX 심볼 찾기
+    try:
+        res = yahoo_search(s, quotes_count=6)
+    except Exception:
+        res = []
+    for it in res:
+        sym = (it or {}).get("symbol", "").upper()
+        if sym.endswith((".KS", ".KQ")) or is_krx_like(sym):
+            return ("krx", sym)
+
+    # 그래도 못 찾으면 글로벌로
+    if res:
+        sym = (res[0] or {}).get("symbol", s).upper()
+        return ("global", sym)
+    return ("global", s)
 
     # ---- (4) Company / Fund Info ----
     st.markdown("<h5>(4) Company / Fund Info</h5>", unsafe_allow_html=True)
 
-    # (3)에서 선택한 자산(one_norm)과 입력창 state를 동기화 → TSLA로 고정되는 문제 방지
-    if st.session_state.get("m_info_symbol_src") != one_norm:
-        st.session_state["m_info_symbol"] = one_norm
-        st.session_state["m_info_symbol_src"] = one_norm
+    # A. 현재 선택(one)을 '정보용 심볼'로 해석해 기본값으로 넣기
+    raw_default = one  # 사용자가 고른 원본 값(라벨일 수도 있음)
+    kind0, resolved0 = resolve_info_symbol(raw_default)
 
     c_fv1, c_fv2 = st.columns([0.22, 0.78])
     with c_fv1:
-        # value= 사용 금지, state만 사용
-        info_sym = st.text_input("티커/코드", key="m_info_symbol").strip().upper()
+        # 사용자가 수정해도 다시 해석해서 라우팅
+        typed = st.text_input("티커/코드", value=resolved0, key="m_info_symbol")
+        kind, info_sym = resolve_info_symbol(typed)
     with c_fv2:
-        st.caption("국내(.KS/.KQ 또는 6자리) → 네이버, 펀드(KR…, 4~6자리 단축) → KOFIA, 그 외 → Finviz")
+        st.caption("국내(.KS/.KQ 또는 6자리)은 네이버, 펀드(KR..., 단축코드)는 KOFIA, 그 외는 Finviz에서 로드합니다.")
 
     if info_sym:
         try:
-            # 1) KOFIA 펀드
-            if is_kofia_code(info_sym):
+            if kind == "krx":
+                # 네이버는 접미사 없이 6자리 코드로 동작 → 안전하게 분리
+                code6 = info_sym.split(".")[0]
+                # ETF 판단: Yahoo 우선, 실패 시 기존 네이버 체크 보조
+                etf_guess = is_etf_yahoo(info_sym) or is_etf_code(info_sym)
+                if etf_guess:
+                    desc, df_info = fetch_naver_etf(code6 + ".KS")  # 내부에서 split 처리하므로 OK
+                else:
+                    desc, df_info = fetch_naver_company(code6 + ".KS")
+                st.markdown(desc)
+                if not df_info.empty:
+                    st.dataframe(df_info, use_container_width=True, height=420)
+                else:
+                    st.caption("네이버 표 데이터를 찾지 못했습니다.")
+
+            elif kind == "kofia":
                 nav_df = fetch_kofia_nav_xml(info_sym, start, end)
                 if not nav_df.empty:
                     fund_nm = (nav_df.get("fundNm").dropna().iloc[0]
@@ -1265,17 +1315,7 @@ def tab_market():
                 else:
                     st.info("KOFIA 기준가 데이터를 찾지 못했습니다.")
 
-            # 2) 국내 주식/ETF (.KS/.KQ 또는 6자리) → 네이버
-            elif info_sym.endswith((".KS", ".KQ")) or _is_krx_symbol(info_sym):
-                profile_text, df_info = fetch_naver_overview(info_sym)
-                st.markdown(profile_text)
-                if not df_info.empty:
-                    st.dataframe(df_info, use_container_width=True, hide_index=True, height=400)
-                else:
-                    st.caption("네이버 표 데이터를 찾지 못했습니다.")
-
-            # 3) 그 외 → Finviz
-            else:
+            else:  # global → Finviz
                 with st.spinner("회사 정보 수집 중..."):
                     profile_text, fv_table = fetch_finviz_company(info_sym)
                 st.markdown(profile_text)
@@ -1287,6 +1327,7 @@ def tab_market():
             st.warning(f"정보 조회 실패: {e}")
     else:
         st.info("심볼/코드를 입력해 주세요.")
+
 
     # ---- 다운로드 ----
     st.markdown("#### 데이터 다운로드")
