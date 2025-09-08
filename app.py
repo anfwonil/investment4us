@@ -1083,7 +1083,7 @@ def tab_market():
     for c in ycols:
         price_df[c] = pd.to_numeric(price_df[c], errors="coerce")
 
-    windows = [("1W",5), ("1M",21), ("3M",63), ("6M",126), ("12M",252), ("36M", 756)]
+    windows = [("1D",1), ("1W",5), ("1M",21), ("3M",63), ("6M",126), ("12M",252), ("36M",756)]
     rows = []
     for c in ycols:
         s = price_df[c].dropna()
@@ -1100,8 +1100,10 @@ def tab_market():
     st.dataframe(
         snap,
         use_container_width=True,
+        hide_index=True,
         column_config={
             "자산": st.column_config.TextColumn("Asset", width="large"),
+            "R_1D": st.column_config.TextColumn("1D"),
             "R_1W": st.column_config.TextColumn("1W"),
             "R_1M": st.column_config.TextColumn("1M"),
             "R_3M": st.column_config.TextColumn("3M"),
@@ -1110,6 +1112,56 @@ def tab_market():
             "R_36M": st.column_config.TextColumn("36M"),
         }
     )
+
+    # ---- (3) Risk & Return Metrics ----
+    st.markdown("<h5>(3) Risk & Return Metrics</h5>", unsafe_allow_html=True)
+
+    rows = []
+    ann = 252  # 연환산 기준 (거래일수)
+
+    for c in ycols:
+        s = price_df[c].dropna()
+        if s.empty:
+            continue
+        ret = s.pct_change().dropna()
+        if ret.empty:
+            continue
+
+        # CAGR
+        cagr = (s.iloc[-1] / s.iloc[0]) ** (ann / len(ret)) - 1.0
+        vol = ret.std() * (ann ** 0.5)
+
+        # Sharpe
+        sharpe = cagr / vol if vol > 0 else float("nan")
+
+        # Sortino (하방 변동성)
+        downside = ret[ret < 0]
+        dstd = downside.std() * (ann ** 0.5) if not downside.empty else float("nan")
+        sortino = cagr / dstd if dstd and dstd > 0 else float("nan")
+
+        # MDD
+        cum = (1 + ret).cumprod()
+        mdd = (cum / cum.cummax() - 1.0).min()
+
+        # Calmar
+        calmar = cagr / abs(mdd) if mdd < 0 else float("nan")
+
+        rows.append([
+            pretty_label_with_fund(c),
+            f"{cagr*100:.2f}%",
+            f"{vol*100:.2f}%",
+            f"{sharpe:.2f}",
+            f"{sortino:.2f}",  # 🔑 추가된 항목
+            f"{mdd*100:.2f}%",
+            f"{calmar:.2f}"
+        ])
+
+    if rows:
+        sumdf = pd.DataFrame(
+            rows,
+            columns=["Asset","CAGR","연변동성","Sharpe","Sortino","MDD","Calmar"]
+        )
+        st.dataframe(sumdf, use_container_width=True, hide_index=True)
 
     # ---- (3) 단일 자산 이동평균 + 캔들/거래량/RSI ----
     st.markdown("<h5>(3) Chart with Candlestick, SMA, Volume & RSI</h5>", unsafe_allow_html=True)
@@ -1128,32 +1180,34 @@ def tab_market():
     # ✅ 별칭 적용
     one_norm = COMMON_ALIASES.get(one.lower(), one)
 
-    # ✅ 데이터 가져오기 (야후 vs KOFIA)
+    # ---- 데이터 가져오기 ----
     if is_kofia_code(one_norm):
+        # ✅ 펀드 (KOFIA NAV)
         df_nav = fetch_kofia_nav_xml(one_norm, start, end)
         if df_nav.empty:
             st.warning("해당 펀드의 NAV 데이터를 불러올 수 없습니다.")
             return
+
         df = pd.DataFrame({
             "Date": df_nav["Date"],
             "Close": pd.to_numeric(df_nav[one_norm], errors="coerce")
         })
         df["Ticker"] = one_norm
         # High/Low/Volume 없음
+
     else:
+        # ✅ 주식/ETF (Yahoo Finance OHLCV)
         ohlcv = fetch_yf_ohlcv((one_norm,), start, end, use_adjust=True)
         if ohlcv.empty:
             st.warning("해당 자산의 OHLCV 데이터를 불러올 수 없습니다.")
             return
         df = ohlcv.copy()
 
-
-        # 이동평균
+    # ---- 공통 지표 계산 (SMA, RSI) ----
+    if "Close" in df.columns:
         for w in (20, 60, 120):
-            if "Close" in df.columns:
-                df[f"SMA{w}"] = df["Close"].rolling(w).mean()
+            df[f"SMA{w}"] = df["Close"].rolling(w).mean()
 
-        # RSI 계산
         def calc_RSI(series, period=14):
             delta = series.diff()
             up = delta.clip(lower=0)
@@ -1161,51 +1215,54 @@ def tab_market():
             roll_up = up.ewm(span=period, adjust=False).mean()
             roll_down = down.ewm(span=period, adjust=False).mean()
             RS = roll_up / roll_down
-            RSI = 100 - (100 / (1 + RS))
-            return RSI
+            return 100 - (100 / (1 + RS))
+
         df["RSI14"] = calc_RSI(df["Close"], 14)
 
-        fig = go.Figure()
+    # ---- 차트 생성 ----
+    fig = go.Figure()
 
-        if {"Open","High","Low","Close"}.issubset(df.columns):
-            # 캔들 가능
-            fig.add_trace(go.Candlestick(
-                x=df["Date"],
-                open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-                increasing_line_color="red", decreasing_line_color="blue",
-                name=one_label
+    if {"Open","High","Low","Close"}.issubset(df.columns):
+        # ✅ 주식/ETF → 캔들 차트
+        fig.add_trace(go.Candlestick(
+            x=df["Date"],
+            open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+            increasing_line_color="red", decreasing_line_color="blue",
+            name=one_label
+        ))
+        if "Volume" in df.columns:
+            fig.add_trace(go.Bar(
+                x=df["Date"], y=df["Volume"],
+                name="Volume", yaxis="y2", opacity=0.4
             ))
-            if "Volume" in df.columns:
-                fig.add_trace(go.Bar(
-                    x=df["Date"], y=df["Volume"],
-                    name="Volume", yaxis="y2", opacity=0.4
-                ))
-            price_domain = [0.45,1.0]; vol_domain=[0.25,0.4]
-        else:
-            # 선차트 (Close만 있는 경우)
-            fig.add_trace(go.Scatter(
-                x=df["Date"], y=df["Close"],
-                mode="lines", name=f"{one_label} (Close)"
-            ))
-            price_domain = [0.3,1.0]; vol_domain=None
+        price_domain = [0.45, 1.0]
+        vol_domain = [0.25, 0.4]
 
+    else:
+        # ✅ 펀드 → 선 차트
+        fig.add_trace(go.Scatter(
+            x=df["Date"], y=df["Close"],
+            mode="lines", name=f"{one_label} (Close)", line=dict(color="blue")
+        ))
+        price_domain = [0.3, 1.0]
+        vol_domain = None
 
-        # 이동평균선
-        for w in (20, 60, 120):
+    # ---- 이동평균선 ----
+    for w in (20, 60, 120):
+        if f"SMA{w}" in df.columns:
             fig.add_trace(go.Scatter(
                 x=df["Date"], y=df[f"SMA{w}"],
                 mode="lines", name=f"SMA{w}", line=dict(dash="dot")
             ))
 
-        # RSI
+    # ---- RSI ----
+    if "RSI14" in df.columns:
         fig.add_trace(go.Scatter(
             x=df["Date"], y=df["RSI14"],
             mode="lines", name="RSI(14)",
             line=dict(color="purple", width=1.2),
             yaxis="y3"
         ))
-
-        # RSI 기준선
         for lvl, clr in [(30, "blue"), (70, "red")]:
             fig.add_trace(go.Scatter(
                 x=df["Date"], y=[lvl]*len(df),
@@ -1214,23 +1271,21 @@ def tab_market():
                 yaxis="y3"
             ))
 
-        # 레이아웃
-        layout_args = dict(
-            title=f"{one_label} — Chart with SMA, Volume & RSI",
-            xaxis=dict(rangeslider=dict(visible=False)),
-            yaxis=dict(title="Price", domain=price_domain),
-            yaxis3=dict(title="RSI", domain=[0.0, 0.2], range=[0,100], showgrid=True),
-            height=850,
-            margin=dict(l=10, r=120, t=30, b=20),
-            legend=dict(orientation="v", yanchor="top", y=0.99, xanchor="left", x=1.02)
-        )
-        if vol_domain:
-            layout_args["yaxis2"] = dict(title="Volume", domain=vol_domain, showgrid=False)
+    # ---- 레이아웃 ----
+    layout_args = dict(
+        title=f"{one_label} — Chart with SMA, Volume & RSI",
+        xaxis=dict(rangeslider=dict(visible=False)),
+        yaxis=dict(title="Price", domain=price_domain),
+        yaxis3=dict(title="RSI", domain=[0.0, 0.2], range=[0,100], showgrid=True),
+        height=850,
+        margin=dict(l=10, r=120, t=30, b=20),
+        legend=dict(orientation="v", yanchor="top", y=0.99, xanchor="left", x=1.02)
+    )
+    if vol_domain:
+        layout_args["yaxis2"] = dict(title="Volume", domain=vol_domain, showgrid=False)
 
-        fig.update_layout(**layout_args)
-
-        st.plotly_chart(fig, use_container_width=True)
-
+    fig.update_layout(**layout_args)
+    st.plotly_chart(fig, use_container_width=True)
 
     # ---- (4) Company / Fund Info ----
     st.markdown("<h5>(4) Company / Fund Info</h5>", unsafe_allow_html=True)
