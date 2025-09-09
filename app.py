@@ -801,26 +801,32 @@ def tab_market():
     max_d = base["Date"].max().date()
     default_start = max(date(2025, 1, 1), min_d)
 
-    left, right = st.columns([1.4, 1])
-    with left:
-        c1, c2 = st.columns(2)
-        with c1:
-            start = st.date_input("시작일", value=default_start,
-                                  min_value=date(2000, 1, 1), max_value=max_d, key="m_start")
-        with c2:
-            end = st.date_input("종료일", value=max_d,
-                                min_value=date(2000, 1, 1), max_value=max_d, key="m_end")
-    with right:
-        st.session_state.setdefault("m_tickers", "")
-        col_inp, col_btn = st.columns([4, 1])
-        with col_inp:
-            st.text_input("티커/펀드코드 입력 (야후 + KOFIA 혼용 가능)",
-                          key="m_tickers",
-                          placeholder="예: SPY, ^KS11, 005930.KS, KR5370199261, 19926")
-        with col_btn:
-            st.markdown("<div style='height:26px'></div>", unsafe_allow_html=True)
-            fetch_clicked = st.button("반영", type="primary", use_container_width=True, key="m_fetch")
-        use_adj = st.checkbox("조정가격 사용(배당/액면 반영)", value=False, key="m_adj")
+    # ▼ 한 줄 레이아웃: 시작일 | 종료일 | 표시통화 | 티커입력 | 버튼
+    st.session_state.setdefault("m_tickers", "")
+    col_s, col_e, col_ccy, col_inp, col_btn = st.columns([1.2, 1.2, 0.9, 3.2, 0.6])
+
+    with col_s:
+        start = st.date_input("시작일", value=default_start,
+                            min_value=date(2000, 1, 1), max_value=max_d, key="m_start")
+
+    with col_e:
+        end = st.date_input("종료일", value=max_d,
+                            min_value=date(2000, 1, 1), max_value=max_d, key="m_end")
+
+    with col_ccy:
+        ccy = st.selectbox("표시통화", ["LOCAL", "KRW", "USD"], index=0, key="m_ccy")
+
+    with col_inp:
+        st.text_input("티커/펀드코드 입력 (야후 + KOFIA 혼용 가능)",
+                    key="m_tickers",
+                    placeholder="예: SPY, ^KS11, 005930.KS, KR5370199261, 19926")
+
+    with col_btn:
+        st.markdown("<div style='height:26px'></div>", unsafe_allow_html=True)  # 버튼 수직 정렬
+        fetch_clicked = st.button("반영", type="primary", use_container_width=True, key="m_fetch")
+
+    # 체크박스는 다음 줄로 두어 공간 확보(원하면 위 col_ccy에 넣어도 됨)
+    use_adj = st.checkbox("조정가격 사용(배당/액면 반영)", value=False, key="m_adj")
 
     # 기본 CSV 구간
     mask = (base["Date"].dt.date >= start) & (base["Date"].dt.date <= end)
@@ -894,6 +900,45 @@ def tab_market():
         else:
             st.info("새로 추가할 항목이 없습니다.")
 
+    # === 통화 변환 (LOCAL/KRW/USD) ===
+    ccy = st.session_state.get("m_ccy", "LOCAL")
+    if ccy in ("KRW", "USD"):
+        usdkrw = None
+
+        # 1) base에 'USDKRW'가 이미 있으면 우선 사용
+        if "USDKRW" in view.columns:
+            usdkrw = view[["Date", "USDKRW"]].dropna().set_index("Date")["USDKRW"]
+        else:
+            # 2) 없으면 야후 환율(KRW=X) 조회
+            fx = fetch_yf_prices(("KRW=X",), start, end, use_adjust=False)
+            if not fx.empty and "KRW=X" in fx.columns:
+                usdkrw = fx.set_index("Date")["KRW=X"]
+
+        if usdkrw is not None and not usdkrw.empty:
+            tmp = view.set_index("Date")
+
+            # 변환 대상 컬럼(숫자형만) — 환율 컬럼은 제외
+            excl = {"USDKRW", "KRW=X"}
+            cols = [c for c in tmp.columns if c not in excl]
+
+            for c in cols:
+                s = pd.to_numeric(tmp[c], errors="coerce")
+
+                # 한국 자산 판별: .KS/.KQ, KOFIA 코드, 대표지수
+                is_kr = (str(c).endswith(".KS") or str(c).endswith(".KQ")
+                        or is_kofia_code(str(c)) or str(c) in ("^KS11", "^KQ11"))
+
+                if ccy == "KRW" and not is_kr:
+                    # 해외/달러자산 → 원화
+                    tmp[c] = s * usdkrw
+                elif ccy == "USD" and is_kr:
+                    # 원화자산 → 달러
+                    tmp[c] = s / usdkrw
+
+            view = tmp.reset_index()
+        else:
+            st.info("환율(USDKRW / KRW=X) 데이터를 불러오지 못해 LOCAL로 표시합니다.")
+    
     # 리인덱싱
     view = reindex_fill_ffill_bfill(view, start, end)
 
@@ -1163,8 +1208,8 @@ def tab_market():
         )
         st.dataframe(sumdf, use_container_width=True, hide_index=True)
 
-    # ---- (3) 단일 자산 이동평균 + 캔들/거래량/RSI ----
-    st.markdown("<h5>(3) Chart with Candlestick, SMA, Volume & RSI</h5>", unsafe_allow_html=True)
+    # ---- (4) 단일 자산 이동평균 + 캔들/거래량/RSI ----
+    st.markdown("<h5>(4) Chart with Candlestick, SMA, Volume & RSI</h5>", unsafe_allow_html=True)
 
     options = [(pretty_label_with_fund(c), c) for c in ycols]  # (라벨, 코드)
     sel_idx = st.selectbox(
@@ -1287,8 +1332,8 @@ def tab_market():
     fig.update_layout(**layout_args)
     st.plotly_chart(fig, use_container_width=True)
 
-    # ---- (4) Company / Fund Info ----
-    st.markdown("<h5>(4) Company / Fund Info</h5>", unsafe_allow_html=True)
+    # ---- (5) Company / Fund Info ----
+    st.markdown("<h5>(5) Company / Fund Info</h5>", unsafe_allow_html=True)
 
     # (3)에서 선택한 자산(one_norm)과 입력창 state를 동기화 → TSLA로 고정되는 문제 방지
     if st.session_state.get("m_info_symbol_src") != one_norm:
