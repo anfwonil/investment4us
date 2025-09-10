@@ -630,11 +630,49 @@ def fetch_naver_overview(sym: str):
 
         df_wide = pd.DataFrame(rows, columns=["Indicator 1","Value 1","Indicator 2","Value 2"])
         return profile_text, df_wide
-
+    
     except Exception as e:
         return f"네이버 페이지 로딩 실패: {e}", pd.DataFrame(
             columns=["Indicator 1","Value 1","Indicator 2","Value 2"]
         )
+
+# === (NEW) 외국인 지분율 ===
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_naver_foreign_ratio(sym: str):
+    """
+    네이버 금융에서 한국 종목의 외국인 지분율(%) 일별 시계열을 수집
+    """
+    from bs4 import BeautifulSoup
+    code6 = _to_krx_code(sym)
+    if not code6:
+        return pd.DataFrame(columns=["Date","ForeignRatio"])
+
+    url = f"https://finance.naver.com/item/frgn.nhn?code={code6}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.encoding = r.apparent_encoding or "euc-kr"
+        tables = pd.read_html(r.text, header=0)
+        if not tables:
+            return pd.DataFrame(columns=["Date","ForeignRatio"])
+
+        df = tables[1].copy()  # 보통 2번째 테이블
+        fr_col = next((c for c in df.columns if "외국인" in str(c)), None)
+        date_col = next((c for c in df.columns if "날짜" in str(c)), None)
+        if not fr_col or not date_col:
+            return pd.DataFrame(columns=["Date","ForeignRatio"])
+
+        out = pd.DataFrame({
+            "Date": pd.to_datetime(df[date_col], errors="coerce"),
+            "ForeignRatio": pd.to_numeric(
+                df[fr_col].astype(str).str.replace("%","").str.replace(",",""),
+                errors="coerce"
+            )
+        }).dropna()
+        return out.sort_values("Date").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=["Date","ForeignRatio"])    
+    
 
 # -------------------- 야후 검색 --------------------
 def yahoo_search(query: str, quotes_count: int = 10):
@@ -1227,10 +1265,11 @@ def tab_market():
 
     # ---- 데이터 가져오기 ----
     if is_kofia_code(one_norm):
+        # ✅ 펀드 (KOFIA NAV)
         df_nav = fetch_kofia_nav_xml(one_norm, start, end)
         if df_nav.empty:
             st.warning("해당 펀드의 NAV 데이터를 불러올 수 없습니다.")
-            st.stop()
+            return
 
         df = pd.DataFrame({
             "Date": df_nav["Date"],
@@ -1240,49 +1279,17 @@ def tab_market():
         # High/Low/Volume 없음
 
     else:
+        # ✅ 주식/ETF (Yahoo Finance OHLCV)
         ohlcv = fetch_yf_ohlcv((one_norm,), start, end, use_adjust=True)
         if ohlcv.empty:
             st.warning("해당 자산의 OHLCV 데이터를 불러올 수 없습니다.")
-            st.stop()
+            return
         df = ohlcv.copy()
 
-    # ---- (NEW) 봉간격 선택 ----
-    freq = st.radio("봉간격 선택", ["일봉", "주봉", "월봉"], horizontal=True)
-
-    df_plot = df.copy()
-    df_plot["Date"] = pd.to_datetime(df_plot["Date"])
-    df_plot.set_index("Date", inplace=True)
-
-    if {"Open","High","Low","Close"}.issubset(df_plot.columns):
-        if freq == "주봉":
-            df_plot = df_plot.resample("W").agg({
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum"
-            }).dropna()
-        elif freq == "월봉":
-            df_plot = df_plot.resample("ME").agg({
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum"
-            }).dropna()
-    else:
-        # 펀드 (Close만 존재)
-        if freq == "주봉":
-            df_plot = df_plot.resample("W").last().dropna()
-        elif freq == "월봉":
-            df_plot = df_plot.resample("M").last().dropna()
-
-    df_plot.reset_index(inplace=True)
-
     # ---- 공통 지표 계산 (SMA, RSI) ----
-    if "Close" in df_plot.columns:
+    if "Close" in df.columns:
         for w in (20, 60, 120):
-            df_plot[f"SMA{w}"] = df_plot["Close"].rolling(w).mean()
+            df[f"SMA{w}"] = df["Close"].rolling(w).mean()
 
         def calc_RSI(series, period=14):
             delta = series.diff()
@@ -1293,22 +1300,22 @@ def tab_market():
             RS = roll_up / roll_down
             return 100 - (100 / (1 + RS))
 
-        df_plot["RSI14"] = calc_RSI(df_plot["Close"], 14)
+        df["RSI14"] = calc_RSI(df["Close"], 14)
 
     # ---- 차트 생성 ----
     fig = go.Figure()
 
-    if {"Open","High","Low","Close"}.issubset(df_plot.columns):
+    if {"Open","High","Low","Close"}.issubset(df.columns):
         # ✅ 주식/ETF → 캔들 차트
         fig.add_trace(go.Candlestick(
-            x=df_plot["Date"],
-            open=df_plot["Open"], high=df_plot["High"], low=df_plot["Low"], close=df_plot["Close"],
+            x=df["Date"],
+            open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
             increasing_line_color="red", decreasing_line_color="blue",
             name=one_label
         ))
-        if "Volume" in df_plot.columns:
+        if "Volume" in df.columns:
             fig.add_trace(go.Bar(
-                x=df_plot["Date"], y=df_plot["Volume"],
+                x=df["Date"], y=df["Volume"],
                 name="Volume", yaxis="y2", opacity=0.4
             ))
         price_domain = [0.45, 1.0]
@@ -1317,7 +1324,7 @@ def tab_market():
     else:
         # ✅ 펀드 → 선 차트
         fig.add_trace(go.Scatter(
-            x=df_plot["Date"], y=df_plot["Close"],
+            x=df["Date"], y=df["Close"],
             mode="lines", name=f"{one_label} (Close)", line=dict(color="blue")
         ))
         price_domain = [0.3, 1.0]
@@ -1325,26 +1332,37 @@ def tab_market():
 
     # ---- 이동평균선 ----
     for w in (20, 60, 120):
-        if f"SMA{w}" in df_plot.columns:
+        if f"SMA{w}" in df.columns:
             fig.add_trace(go.Scatter(
-                x=df_plot["Date"], y=df_plot[f"SMA{w}"],
+                x=df["Date"], y=df[f"SMA{w}"],
                 mode="lines", name=f"SMA{w}", line=dict(dash="dot")
             ))
 
     # ---- RSI ----
-    if "RSI14" in df_plot.columns:
+    if "RSI14" in df.columns:
         fig.add_trace(go.Scatter(
-            x=df_plot["Date"], y=df_plot["RSI14"],
+            x=df["Date"], y=df["RSI14"],
             mode="lines", name="RSI(14)",
             line=dict(color="purple", width=1.2),
             yaxis="y3"
         ))
         for lvl, clr in [(30, "blue"), (70, "red")]:
             fig.add_trace(go.Scatter(
-                x=df_plot["Date"], y=[lvl]*len(df_plot),
+                x=df["Date"], y=[lvl]*len(df),
                 mode="lines", name=f"RSI {lvl}",
                 line=dict(color=clr, dash="dash", width=1),
                 yaxis="y3"
+            ))
+
+    # ---- 외국인 지분율 ----
+    if _is_krx_symbol(one_norm):
+        fr_df = fetch_naver_foreign_ratio(one_norm)
+        if not fr_df.empty:
+            fig.add_trace(go.Scatter(
+                x=fr_df["Date"], y=fr_df["ForeignRatio"],
+                mode="lines", name="외국인 지분율(%)",
+                line=dict(color="green", width=1.5, dash="dot"),
+                yaxis="y4"
             ))
 
     # ---- 레이아웃 ----
@@ -1360,10 +1378,32 @@ def tab_market():
     if vol_domain:
         layout_args["yaxis2"] = dict(title="Volume", domain=vol_domain, showgrid=False)
 
+    # 🔑 외국인 지분율 y축 추가
+    if _is_krx_symbol(one_norm):
+        layout_args["yaxis4"] = dict(
+            title="외국인 지분율(%)", domain=[0.20,0.28],
+            showgrid=False, overlaying="y", side="right"
+        )
+
     fig.update_layout(**layout_args)
+    st.plotly_chart(fig, use_container_width=True, key="market_chart_main")
 
+
+    # ---- 레이아웃 ----
+    layout_args = dict(
+        title=f"{one_label} — Chart with SMA, Volume & RSI",
+        xaxis=dict(rangeslider=dict(visible=False)),
+        yaxis=dict(title="Price", domain=price_domain),
+        yaxis3=dict(title="RSI", domain=[0.0, 0.2], range=[0,100], showgrid=True),
+        height=850,
+        margin=dict(l=10, r=120, t=30, b=20),
+        legend=dict(orientation="v", yanchor="top", y=0.99, xanchor="left", x=1.02)
+    )
+    if vol_domain:
+        layout_args["yaxis2"] = dict(title="Volume", domain=vol_domain, showgrid=False)
+
+    fig.update_layout(**layout_args)
     st.plotly_chart(fig, use_container_width=True)
-
 
     # ---- (5) Company / Fund Info ----
     st.markdown("<h5>(5) Company / Fund Info</h5>", unsafe_allow_html=True)
