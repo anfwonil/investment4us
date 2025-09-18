@@ -1529,7 +1529,12 @@ def tab_portfolio():
     with c5:
         rb_mode = st.selectbox("리밸런싱", ["없음(바이앤홀드)", "매월", "분기", "매년"], index=0, key="p_rbmode")
     with c6:
-        bench = st.text_input("벤치마크(옵션, 예: SPY, QQQ, ^GSPC)", value="SPY", key="p_bench")
+        bench = st.text_input(
+            "벤치마크(옵션, 예: SPY, QQQ, ^GSPC)",
+            value="",                      # ✅ 기본값 비움 → 벤치마크 비표시
+            placeholder="예: SPY, QQQ, ^GSPC",
+            key="p_bench"
+        )
 
     n1, n2, n3 = st.columns(3)
     with n1: name1 = st.text_input("포트폴리오 1 이름", value="포트폴리오 1안", key="p_name1")
