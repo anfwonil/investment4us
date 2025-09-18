@@ -1717,35 +1717,13 @@ def tab_portfolio():
         idx = bench_line.index if idx is None else idx.union(bench_line.index)
     if idx is None: idx = prices.index
 
-    # --- Show Holdings 표시 토글 (Streamlit 1.25+ 에서는 st.toggle, 낮은 버전이면 st.checkbox 사용) ---
-    try:
-        show_individual = st.toggle("Show Holdings", value=False, help="포트폴리오와 구성 종목의 수익률/낙폭을 함께 표시")
-    except Exception:
-        show_individual = st.checkbox("Show Holdings", value=False, help="포트폴리오와 구성 종목의 수익률/낙폭을 함께 표시")
-
-    # 포트폴리오 누적수익(%) DataFrame
     df_plot = pd.DataFrame(index=idx).sort_index()
     for nm, s in portfolios:
-        if s is not None and not s.empty:
+        if not s.empty:
             df_plot[nm] = (s / s.iloc[0] - 1.0) * 100.0
     if bench_line is not None:
         df_plot[bench_line.name] = (bench_line / bench_line.dropna().iloc[0] - 1.0) * 100.0
-
-    # ✅ (추가) Show Holdings이 켜져 있으면 구성 종목도 함께 표시
-    if show_individual:
-        # prices: 위에서 만든, 통화변환/리샘플/공통 시작일 정렬 후의 가격 테이블 (index=Date)
-        indiv = prices[[c for c in prices.columns if c != "Date"]].copy()
-        # 누적수익(%)로 변환
-        for c in indiv.columns:
-            s = indiv[c].dropna()
-            if s.empty:
-                continue
-            ret = (indiv[c] / s.iloc[0] - 1.0) * 100.0
-            label = pretty_label_with_fund(c)  # 보기 좋은 라벨
-            df_plot[label] = ret.reindex(df_plot.index)
-
-    df_plot = df_plot.reset_index().rename(columns={"index": "Date"})
-
+    df_plot = df_plot.reset_index().rename(columns={"index":"Date"})
 
     fig = px.line(df_plot, x="Date", y=[c for c in df_plot.columns if c != "Date"], render_mode="svg")
     fig.update_layout(margin=dict(l=10, r=110, t=10, b=10), height=480,
@@ -1773,22 +1751,10 @@ def tab_portfolio():
     for nm, s in portfolios:
         if not s.empty:
             comp[f"{nm} MDD(%)"] = (s / s.cummax() - 1.0) * 100.0
-
     if bench_line is not None:
-        bench_equity = (bench_line / bench_line.dropna().iloc[0]).reindex(comp.index).ffill()
+        bench_equity = (1.0 + (bench_line - bench_line.dropna().iloc[0]) / bench_line.dropna().iloc[0]).reindex(comp.index).ffill()
         bench_equity.iloc[0] = 1.0
         comp[f"{bench_name} MDD(%)"] = (bench_equity / bench_equity.cummax() - 1.0) * 100.0
-
-    # ✅ (추가) Show Holdings이 켜져 있으면 종목 MDD도 함께 표시
-    if show_individual:
-        indiv = prices[[c for c in prices.columns if c != "Date"]].copy()
-        for c in indiv.columns:
-            s = indiv[c].dropna()
-            if s.empty:
-                continue
-            eq = (indiv[c] / s.iloc[0]).reindex(comp.index).ffill()   # 누적지수화
-            label = f"{pretty_label_with_fund(c)} MDD(%)"
-            comp[label] = (eq / eq.cummax() - 1.0) * 100.0
 
     comp = comp.reset_index().rename(columns={"index":"Date"})
     mdd_cols = [c for c in comp.columns if c != "Date"]
