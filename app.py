@@ -699,6 +699,7 @@ def fetch_yf_prices(tickers: tuple, start, end, use_adjust=True) -> pd.DataFrame
         progress=False,
         threads=True,
         actions=False,
+        repair=True,
     )
     if raw.empty:
         return pd.DataFrame()
@@ -863,6 +864,11 @@ def tab_market():
             # ✅ Market 탭에서는 펀드명 검색 금지 → 정확한 코드만 허용
             if t_clean in FUND_CODE_SET or is_kofia_code(t_clean):
                 hits = [t_clean]
+            
+            # ✅ 추가: 한국 거래소 심볼(.KS/.KQ 또는 6자리)은 야후가 빈 응답이어도 통과
+            elif re.fullmatch(r"\d{6}(\.K[QS])?", t_clean):
+                hits = [t_clean if '.K' in t_clean else t_clean + '.KS']
+
             else:
                 # 야후 티커 확인
                 try:
@@ -1885,6 +1891,7 @@ def fetch_yf_ohlcv(tickers: tuple, start, end, use_adjust=True) -> pd.DataFrame:
         progress=False,
         threads=True,
         actions=False,
+        repair=True,
     )
     if raw.empty:
         return pd.DataFrame(columns=cols_out)
