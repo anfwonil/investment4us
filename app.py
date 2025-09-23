@@ -177,33 +177,42 @@ def pretty_label_with_fund(code_or_ticker: str) -> str:
     """
     라벨 우선순위:
       1) FUND_MAP에 있으면 name20
-      2) KOFIA 코드면 KOFIA에서 fundNm (캐시)
+      2) KOFIA 코드면 KOFIA에서 fundNm (가능할 때만; 안전 폴백 포함)
       3) 그 외는 야후 shortName/longName → 20자 말줄임
     """
     c = str(code_or_ticker or "").strip().upper()
     if not c:
         return ""
 
-    # 1) 매핑파일
+    # 1) 매핑파일 우선
     try:
-        hit = FUND_MAP.loc[FUND_MAP["code"] == c]
-        if not hit.empty:
-            return str(hit.iloc[0]["name20"])
+        if "FUND_MAP" in globals():
+            hit = FUND_MAP.loc[FUND_MAP["code"] == c]
+            if not hit.empty:
+                return str(hit.iloc[0]["name20"])
     except Exception:
         pass
 
-    # 2) KOFIA 코드 → fundNm
-    if is_kofia_code(c):
-        nm = _kofia_name(c)
-        if nm:
-            return _truncate20_ellipsis(nm)
+    # 2) KOFIA 코드 → fundNm (헬퍼가 아직 없을 수도 있어 안전 조회)
+    try:
+        if is_kofia_code(c):
+            _kofia = globals().get("_kofia_name", lambda _x: None)
+            _trunc = globals().get("_truncate20_ellipsis",
+                                   lambda s: (str(s).strip()[:20] + "…") if len(str(s).strip()) > 20 else str(s).strip())
+            nm = _kofia(c)
+            if nm:
+                return _trunc(nm)
+    except Exception:
+        # 어떤 이유로든 실패하면 다음 단계로 폴백
+        pass
 
-    # 3) 야후/기타
+    # 3) 야후/기타 폴백 (여기도 실패해도 최종적으로 심볼 그대로 반환)
     try:
         lbl = pretty_label(c)  # 이미 20자 처리 포함
         return lbl
     except Exception:
         return c
+
 
 # --- KOFIA 펀드명 캐시 조회(하루 캐시) + 20자 말줄임 ---
 @st.cache_data(ttl=86400, show_spinner=False)
