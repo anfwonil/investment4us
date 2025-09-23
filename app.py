@@ -173,20 +173,32 @@ def search_ticker_or_fund(query: str):
 
     return []
 
-
 def pretty_label_with_fund(code_or_ticker: str) -> str:
     """
-    그래프 라벨에 사용할 표시명:
-    - FUND_MAP에 있으면 펀드명(20자)
-    - 없으면 기존 pretty_label(code_or_ticker) 결과 사용
+    우선순위:
+      1) 매핑 파일(FUND_MAP)
+      2) KOFIA 실시간 조회(fundNm)  ⬅️ NEW
+      3) 그 외: 야후 라벨 or 원코드
     """
     c = str(code_or_ticker).upper()
-    hit = FUND_MAP.loc[FUND_MAP["code"]==c]
-    if not hit.empty:
-        return hit.iloc[0]["name20"]
-    # (기존 pretty_label 이 이미 있다면 그걸 호출하세요)
+
+    # 1) 매핑파일
     try:
-        return pretty_label(c)  # 당신의 기존 함수
+        hit = FUND_MAP.loc[FUND_MAP["code"] == c]
+        if not hit.empty:
+            return hit.iloc[0]["name20"]
+    except Exception:
+        pass
+
+    # 2) KOFIA 코드면 KOFIA에서 이름 회수 (하루 캐시)
+    if is_kofia_code(c):
+        nm = _kofia_name(c)
+        if nm:
+            return _truncate20_ellipsis(nm)
+
+    # 3) 야후/기타
+    try:
+        return pretty_label(c)
     except Exception:
         return c
     
