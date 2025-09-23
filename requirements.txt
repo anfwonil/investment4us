@@ -10,3 +10,4 @@ html5lib
 openpyxl>=3.1.0
 xlrd>=2.0.1
 lxml>=4.9.0
+scipy>=1.14,<2
