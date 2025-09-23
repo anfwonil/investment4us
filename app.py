@@ -14,7 +14,7 @@ import streamlit as st
 import yfinance as yf
 import requests
 from io import StringIO
-
+from typing import Optional 
 
 st.set_page_config(page_title="Market Performance", layout="wide")
 
@@ -175,22 +175,24 @@ def search_ticker_or_fund(query: str):
 
 def pretty_label_with_fund(code_or_ticker: str) -> str:
     """
-    우선순위:
-      1) 매핑 파일(FUND_MAP)
-      2) KOFIA 실시간 조회(fundNm)  ⬅️ NEW
-      3) 그 외: 야후 라벨 or 원코드
+    라벨 우선순위:
+      1) FUND_MAP에 있으면 name20
+      2) KOFIA 코드면 KOFIA에서 fundNm (캐시)
+      3) 그 외는 야후 shortName/longName → 20자 말줄임
     """
-    c = str(code_or_ticker).upper()
+    c = str(code_or_ticker or "").strip().upper()
+    if not c:
+        return ""
 
     # 1) 매핑파일
     try:
         hit = FUND_MAP.loc[FUND_MAP["code"] == c]
         if not hit.empty:
-            return hit.iloc[0]["name20"]
+            return str(hit.iloc[0]["name20"])
     except Exception:
         pass
 
-    # 2) KOFIA 코드면 KOFIA에서 이름 회수 (하루 캐시)
+    # 2) KOFIA 코드 → fundNm
     if is_kofia_code(c):
         nm = _kofia_name(c)
         if nm:
@@ -198,27 +200,28 @@ def pretty_label_with_fund(code_or_ticker: str) -> str:
 
     # 3) 야후/기타
     try:
-        return pretty_label(c)
+        lbl = pretty_label(c)  # 이미 20자 처리 포함
+        return lbl
     except Exception:
         return c
-    
-    def label_of(sym: str) -> str:
-        s = str(sym).strip().upper()
-        if not FUND_MAP.empty and "code" in FUND_MAP.columns:
-            hit = FUND_MAP.loc[FUND_MAP["code"] == s]
-            if not hit.empty:
-                return hit.iloc[0]["name20"]  # 20자 절단 펀드명
-        return pretty_label(s)
 
-def _is_krx_symbol(s: str) -> bool:
-    """6자리(선택적으로 .KS/.KQ) 한국거래소 심볼 판별"""
-    s = str(s).strip().upper()
-    return bool(re.fullmatch(r"\d{6}(\.K[QS])?", s))
+# --- KOFIA 펀드명 캐시 조회(하루 캐시) + 20자 말줄임 ---
+@st.cache_data(ttl=86400, show_spinner=False)
+def _kofia_name(code: str) -> Optional[str]:
+    """KOFIA 코드로 펀드명 한 번만 가져와서 캐시"""
+    try:
+        today = pd.Timestamp.today().date()
+        start = today - pd.Timedelta(days=60)  # 짧게 조회해도 fundNm은 함께 옴
+        df = fetch_kofia_nav_xml(code, start, today)
+        if not df.empty and "fundNm" in df.columns and df["fundNm"].notna().any():
+            return str(df["fundNm"].dropna().iloc[0]).strip()
+    except Exception:
+        pass
+    return None
 
-def _to_krx_code(s: str) -> str | None:
-    """'005930' 또는 '005930.KS' → '005930'로 표준화, 아니면 None"""
-    m = re.fullmatch(r"(\d{6})(?:\.K[QS])?$", str(s).strip().upper())
-    return m.group(1) if m else None
+def _truncate20_ellipsis(s: str) -> str:
+    s = str(s).strip()
+    return (s[:20] + "…") if len(s) > 20 else s
 
 
 # ==== KOFIA(DIS) XML endpoint helpers ========================================
@@ -296,7 +299,23 @@ def _extract_kofia_name_from_xml(xml_bytes: bytes) -> str | None:
     except Exception:
         return None
 
-    # 1) 가장 가능성 높은 태그들 우선
+    def _is_noise(txt: str) -> bool:
+        # 내부 키/코드처럼 보이거나 특수기호가 많은 값은 제외
+        t = txt.strip()
+        tl = t.lower()
+        if not t or t.isdigit():
+            return True
+        if "tmpv" in tl or "vgrid" in tl or t.startswith(("tmp", "ext")):
+            return True
+        if "^" in t or "=" in t or "{" in t or "}" in t:
+            return True
+        # 영문/한글 알파벳이 거의 없는 값도 제외
+        alpha_cnt = sum(ch.isalpha() for ch in t)
+        if alpha_cnt < 2:
+            return True
+        return False
+
+    # 1) 우선 태그 후보들
     name_tags = [
         "fundNm", "fundName",
         "fnccFundNm", "fnccFundNm1", "fnccFundNm2",
@@ -305,25 +324,20 @@ def _extract_kofia_name_from_xml(xml_bytes: bytes) -> str | None:
     for tag in name_tags:
         vals = root.xpath(f'//*[local-name()="{tag}"]/text()')
         for v in vals:
-            s = (v or "").strip()
-            if not s:
-                continue
-            # vGridBtn1 등은 <a>태그가 섞여 올 수 있으니 태그 제거
-            s = re.sub(r"<[^>]*>", "", s)
+            s = re.sub(r"<[^>]*>", "", (v or "")).strip()
             s = re.sub(r"\s+", " ", s).strip()
-            if s:
+            if s and not _is_noise(s):
                 return s
 
-    # 2) 혹시 속성(attribute)에 이름이 들어오는 케이스도 방어
-    cand_nodes = root.xpath('//*[@*]')
-    for node in cand_nodes:
+    # 2) 속성(attribute)에도 혹시 이름이 있을 수 있어 스캔
+    for node in root.xpath('//*[@*]'):
         for _, attr_val in getattr(node, 'attrib', {}).items():
             s = re.sub(r"<[^>]*>", "", (attr_val or "")).strip()
-            if s and len(s) >= 3 and not s.isdigit():
+            s = re.sub(r"\s+", " ", s).strip()
+            if s and len(s) >= 3 and not _is_noise(s):
                 return s
 
     return None
-
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_kofia_nav_xml(code: str, start, end) -> pd.DataFrame:
@@ -514,6 +528,23 @@ YAHOO_ALIAS = {
 def to_yahoo_ticker(code: str) -> str:
     c = (code or "").strip()
     return YAHOO_ALIAS.get(c.upper(), COMMON_ALIASES.get(c.lower(), c))
+
+# --- KRX helpers -------------------------------------------------------------
+def _is_krx_symbol(s: str) -> bool:
+    """6자리 숫자 또는 .KS/.KQ로 끝나면 KRX 심볼로 간주"""
+    if not s:
+        return False
+    t = str(s).strip().upper()
+    return t.endswith((".KS", ".KQ")) or bool(re.fullmatch(r"\d{6}", t))
+
+def _to_krx_code(sym: str) -> Optional[str]:
+    """005930.KS -> 005930 / 005930 -> 005930 / 그 외 -> None"""
+    if not sym:
+        return None
+    t = str(sym).strip().upper()
+    m = re.match(r"^(\d{6})(?:\.K[QS])?$", t)
+    return m.group(1) if m else None
+
 
 # -------------------- Finviz 크롤러 --------------------
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1002,9 +1033,8 @@ def tab_market():
     for c in ycols:
         base_lbl = base_map[c]
         lbl = base_lbl
-        k = 2
-        while lbl in used:
-            lbl = f"{base_lbl} ({c})[{k}]"; k += 1
+        if lbl in used:
+            lbl = f"{base_lbl} ({c})"   # 중복이면 심볼만 덧붙여 구분
         unique_map[c] = lbl; used.add(lbl)
 
     # ===== 데이터 가공 & 그래프 =====
@@ -1426,7 +1456,7 @@ def tab_market():
                     st.info("KOFIA 기준가 데이터를 찾지 못했습니다.")
 
             # 2) 국내 주식/ETF (.KS/.KQ 또는 6자리) → 네이버
-            elif info_sym.endswith((".KS", ".KQ")) or _is_krx_symbol(info_sym):
+            elif _is_krx_symbol(info_sym):
                 profile_text, df_info = fetch_naver_overview(info_sym)
                 st.markdown(profile_text)
                 if not df_info.empty:
@@ -1693,6 +1723,7 @@ def tab_portfolio():
             elif base_ccy == "USD" and is_kr:
                 tmp[c] = tmp[c] / usdkrw
         px_df = tmp.reset_index()
+        px_df = reindex_fill_ffill_bfill(px_df, start, end, ffill_limit=5, kofia_ffill_limit=5)
 
     prices = px_df.set_index("Date")
     num_cols = [c for c in prices.columns if c != "Date"]
@@ -1775,6 +1806,7 @@ def tab_portfolio():
 
 
     fig = px.line(df_plot, x="Date", y=[c for c in df_plot.columns if c != "Date"], render_mode="svg")
+    fig.update_traces(line=dict(dash="solid"))
     fig.update_layout(margin=dict(l=10, r=110, t=10, b=10), height=480,
                       yaxis_title=f"누적 수익률 (%) — 기준통화: {base_ccy}",
                       uirevision="pf1", xaxis_rangeslider_visible=False)
@@ -2098,18 +2130,18 @@ def tab_research_global():
         extra_frames = []
         for f in fund_files or []:
             try:
-                if f.name.lower().endswith(".csv"):
-                    df = pd.read_csv(f)
-                else:
-                    df = pd.read_excel(f)
-                # 유연한 컬럼명 처리
+                df = pd.read_csv(f) if f.name.lower().endswith(".csv") else pd.read_excel(f)
                 cols = {c.strip(): c for c in df.columns}
-                date_col = next((cols[c] for c in cols if c.lower() in ("date","일자","기준일","기준일자")), None)
+                date_col  = next((cols[c] for c in cols if c.lower() in ("date","일자","기준일","기준일자")), None)
                 close_col = next((cols[c] for c in cols if c.lower() in ("close","기준가","nav","가격")), None)
-                if date_col and close_col:
-                    tmp = df[[date_col, close_col]].copy()
+
+                if not (date_col and close_col):
+                    st.warning(f"파일 형식 인식 실패: {f.name} (필요 컬럼: Date/일자 + Close/기준가)")
+                    continue
+
+                tmp = df[[date_col, close_col]].copy()
                 tmp.columns = ["Date","Close"]
-                tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
+                tmp["Date"]  = pd.to_datetime(tmp["Date"], errors="coerce")
                 tmp["Close"] = pd.to_numeric(tmp["Close"], errors="coerce")
                 tmp["Ticker"] = os.path.splitext(os.path.basename(f.name))[0].upper()
                 tmp["High"] = pd.NA; tmp["Low"] = pd.NA; tmp["Volume"] = pd.NA
@@ -2261,9 +2293,10 @@ def safe_tab(render_fn, name: str):
 
 # 탭 생성
 tab1, tab2, tab3 = st.tabs(["Market", "Portfolio", "Analysis"])
-with tab1:  tab_market()
-with tab2:  tab_portfolio()
-with tab3:  tab_research_global()
+with tab1:  safe_tab(tab_market, "Market")
+with tab2:  safe_tab(tab_portfolio, "Portfolio")
+with tab3:  safe_tab(tab_research_global, "Analysis")
+
 
 # 깃허브 사이트
 # https://github.com/anfwonil/investment4us
