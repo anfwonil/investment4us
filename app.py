@@ -492,6 +492,17 @@ COMMON_ALIASES = {
     "usdkrw": "USDKRW=X", "usdcny": "CNY=X",
 }
 
+YAHOO_ALIAS = {
+    "USDKRW": "USDKRW=X",
+    "USDJPY": "USDJPY=X",
+    "SPX": "^GSPC",
+    "NDX": "^NDX",
+    "NIKKEI": "^N225",
+}
+def to_yahoo_ticker(code: str) -> str:
+    c = (code or "").strip()
+    return YAHOO_ALIAS.get(c.upper(), COMMON_ALIASES.get(c.lower(), c))
+
 # -------------------- Finviz 크롤러 --------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_finviz_company(ticker: str):
@@ -1226,10 +1237,8 @@ def tab_market():
         key="m_ma_one_idx"
     )
     one = options[sel_idx][1]                 # 내부 코드
-    one_label = pretty_label_with_fund(one)   # 라벨
-
-    # ✅ 별칭 적용
-    one_norm = COMMON_ALIASES.get(one.lower(), one)
+    one_label = pretty_label_with_fund(one)   # 라벨  
+    one_norm = to_yahoo_ticker(one)
 
     # ---- 데이터 가져오기 ----
     if is_kofia_code(one_norm):
@@ -1281,7 +1290,7 @@ def tab_market():
         if freq == "주봉":
             df_plot = df_plot.resample("W").last().dropna()
         elif freq == "월봉":
-            df_plot = df_plot.resample("M").last().dropna()
+            df_plot = df_plot.resample("ME").last().dropna()
 
     df_plot.reset_index(inplace=True)
 
@@ -2230,6 +2239,13 @@ if search_clicked and q_global.strip():
             exch = item.get("exchDisp") or ""
             qt   = item.get("quoteType") or ""
             st.markdown(f"**{sym}** — {name} · {exch} · {qt}")
+
+def safe_tab(render_fn, name: str):
+    try:
+        render_fn()
+    except Exception as e:
+        st.error(f"[{name}] 탭 렌더링 중 오류가 발생했습니다.")
+        st.exception(e)
 
 # 탭 생성
 tab1, tab2, tab3 = st.tabs(["Market", "Portfolio", "Analysis"])
