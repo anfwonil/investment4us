@@ -1840,12 +1840,12 @@ def tab_portfolio():
     comp = pd.DataFrame(index=idx).sort_index()
     for nm, s in portfolios:
         if not s.empty:
-            comp[f"{nm} MDD(%)"] = (s / s.cummax() - 1.0) * 100.0
+            comp[nm] = (s / s.cummax() - 1.0) * 100.0
 
     if bench_line is not None:
         bench_equity = (bench_line / bench_line.dropna().iloc[0]).reindex(comp.index).ffill()
         bench_equity.iloc[0] = 1.0
-        comp[f"{bench_name} MDD(%)"] = (bench_equity / bench_equity.cummax() - 1.0) * 100.0
+        comp[bench_name] = (bench_equity / bench_equity.cummax() - 1.0) * 100.0
 
     # ✅ (추가) Show Holdings이 켜져 있으면 종목 MDD도 함께 표시
     if show_individual:
@@ -1855,7 +1855,7 @@ def tab_portfolio():
             if s.empty:
                 continue
             eq = (indiv[c] / s.iloc[0]).reindex(comp.index).ffill()   # 누적지수화
-            label = f"{pretty_label_with_fund(c)} MDD(%)"
+            label = pretty_label_with_fund(c)
             comp[label] = (eq / eq.cummax() - 1.0) * 100.0
 
     comp = comp.reset_index().rename(columns={"index":"Date"})
