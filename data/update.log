@@ -218,3 +218,15 @@
 [2026-04-04 11:02:42] 라벨 기준 최신일자: {'USDKRW': datetime.date(2026, 4, 4), 'SP500': datetime.date(2026, 4, 4), 'KOSPI': datetime.date(2026, 4, 4)}
 [2026-04-04 11:02:42] 저장 완료: C:\Users\woori\Desktop\top10\data\market_timeseries.csv
 [2026-04-04 11:02:42] === 실행 종료 ===
+[2026-04-07 10:03:08] === 실행 시작 (update.py v1.2) ===
+[2026-04-07 10:03:08] 기존 CSV 발견. 마지막 날짜: 2026-04-04 → 백필 7일 적용 새로 받을 시작일: 2026-03-28
+[2026-04-07 10:03:09] 원티커 기준 최신일자: {'KRW=X': datetime.date(2026, 4, 7), '^GSPC': datetime.date(2026, 4, 6), '^KS11': datetime.date(2026, 4, 7)}
+[2026-04-07 10:03:09] 라벨 기준 최신일자: {'USDKRW': datetime.date(2026, 4, 7), 'SP500': datetime.date(2026, 4, 7), 'KOSPI': datetime.date(2026, 4, 7)}
+[2026-04-07 10:03:09] 저장 완료: C:\Users\woori\Desktop\top10\data\market_timeseries.csv
+[2026-04-07 10:03:09] === 실행 종료 ===
+[2026-04-15 10:04:19] === 실행 시작 (update.py v1.2) ===
+[2026-04-15 10:04:19] 기존 CSV 발견. 마지막 날짜: 2026-04-07 → 백필 7일 적용 새로 받을 시작일: 2026-03-31
+[2026-04-15 10:04:20] 원티커 기준 최신일자: {'KRW=X': datetime.date(2026, 4, 15), '^GSPC': datetime.date(2026, 4, 14), '^KS11': datetime.date(2026, 4, 15)}
+[2026-04-15 10:04:20] 라벨 기준 최신일자: {'USDKRW': datetime.date(2026, 4, 15), 'SP500': datetime.date(2026, 4, 15), 'KOSPI': datetime.date(2026, 4, 15)}
+[2026-04-15 10:04:20] 저장 완료: C:\Users\woori\Desktop\top10\data\market_timeseries.csv
+[2026-04-15 10:04:20] === 실행 종료 ===

@@ -2316,6 +2316,10 @@ with tab3:  safe_tab(tab_research_global, "Analysis")
 # git commit -m "chore: update data and backup folders"
 # git push
 
+# git pull --rebase origin main
+# git push origin main
+
+
 #   g
 # git commit -m "update: latest changes from run_update"
 # git push origin main
